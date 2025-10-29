@@ -89,7 +89,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine, Row
+from sqlalchemy.engine import Engine, Row, make_url
 from sqlalchemy.exc import SQLAlchemyError
 
 # ------------------
@@ -140,8 +140,19 @@ SET = Settings(
 def _create_state_engine(url: str) -> Engine:
     # APScheduler uses background threads; SQLite needs check_same_thread=False
     if url.startswith("sqlite:"):
-        return create_engine(url, future=True, connect_args={"check_same_thread": False})
+        try:
+            u = make_url(url)
+            db_path = u.database
+            if db_path and db_path != ":memory:":
+                os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            return create_engine(url, future=True, connect_args={"check_same_thread": False})
+        except Exception as e:
+            fallback = "sqlite:////tmp/bot.db"
+            os.makedirs("/tmp", exist_ok=True)
+            logger.warning("State DB '%s' unavailable (%s). Falling back to %s", url, e, fallback)
+            return create_engine(fallback, future=True, connect_args={"check_same_thread": False})
     return create_engine(url, future=True, pool_pre_ping=True)
+
 
 STATE_ENGINE: Engine = _create_state_engine(STATE_DB_URL)
 
@@ -168,7 +179,19 @@ CREATE TABLE IF NOT EXISTS kv (
 # ------------------
 # Templates bootstrap
 # ------------------
-TEMPLATES_PATH = "/data/templates.yaml"
+def _templates_path_from_state(url: str) -> str:
+    try:
+        if url.startswith("sqlite:"):
+            u = make_url(url)
+            base = os.path.dirname(u.database) if (u and u.database and u.database != ":memory:") else "/tmp"
+        else:
+            base = "/tmp"
+    except Exception:
+        base = "/tmp"
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "templates.yaml")
+
+TEMPLATES_PATH = _templates_path_from_state(STATE_DB_URL)
 
 DEFAULT_TEMPLATES_YAML = """
 post_templates:
