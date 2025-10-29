@@ -19,7 +19,7 @@ Quick start on Railway
 1) Create a new service from this file.
 2) Add a Railway Volume and mount to `/data` (or use a separate Postgres for state).
 3) Set ENV VARS (see ENV VARS section below). Start command:
-      uvicorn app:app --host 0.0.0.0 --port ${PORT}
+      uvicorn main:app --host 0.0.0.0 --port ${PORT}
 4) Provide a READ-ONLY `DATABASE_URL` to your main school directory DB.
 5) (Optional) Create a view `public.bot_schools_v` in your main DB matching the DDL at bottom, or set BOT_SCHOOLS_SQL to your schema.
 6) Visit `/dry-run?count=5` to preview posts before enabling real publishing.
@@ -83,6 +83,7 @@ from jinja2 import Environment, BaseLoader, StrictUndefined
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+from functools import lru_cache
 
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -109,7 +110,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 STATE_DB_URL = os.getenv("BOT_STATE_DB_URL", "sqlite:////data/bot.db")
 SCHOOLS_SQL = os.getenv("BOT_SCHOOLS_SQL", "SELECT * FROM public.bot_schools_v;")
 
-DAILY_SLOTS = [s.strip() for s in os.getenv("DAILY_SLOTS", "09:00,13:00,17:30").split(",") if s.strip()]
+DAILY_SLOTS = [s.strip().strip('"').strip("'") for s in os.getenv("DAILY_SLOTS", "09:00,13:00,17:30").split(",") if s.strip()]
 POSTS_PER_SLOT = int(os.getenv("POSTS_PER_SLOT", "1"))
 PER_SCHOOL_MONTHLY_CAP = int(os.getenv("PER_SCHOOL_MONTHLY_CAP", "2"))
 COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "14"))
@@ -249,7 +250,7 @@ class School:
     media_approved: bool
     opt_out: bool
     admissions_note: Optional[str] = None
-    value_points: List[str] = None
+    value_points: Optional[List[str]] = None
     media_caption: Optional[str] = None
     open_day: Optional[str] = None
 
@@ -369,6 +370,7 @@ def fetch_schools() -> List[School]:
 # Template rendering
 # ------------------
 
+@lru_cache(maxsize=1)
 def build_env() -> Environment:
     env = Environment(loader=BaseLoader(), autoescape=False, undefined=StrictUndefined)
     env.filters["slice"] = lambda seq, n: list(seq)[:n]
@@ -376,6 +378,7 @@ def build_env() -> Environment:
         return sep.join([str(x) for x in iterable])
     env.filters["join"] = join_filter
     return env
+
 
 
 def select_template(templates: Dict[str, Any], school: School, purpose: str = "rotation") -> Dict[str, Any]:
@@ -432,7 +435,8 @@ class ConsolePublisher(Publisher):
     platform = "console"
 
     def publish(self, text: str, media_url: Optional[str] = None) -> PublishResult:
-        logger.info("[DRY] %s | %s%s", self.platform, text, f" [media={media_url}]" if media_url else "")
+        prefix = "[DRY]" if DRY_RUN else "[LIVE]"
+        logger.info("%s %s | %s%s", prefix, self.platform, text, f" [media={media_url}]" if media_url else "")
         return PublishResult({"platform": self.platform, "id": None, "text": text})
 
 
@@ -443,9 +447,15 @@ class XPublisher(Publisher):
         self.bearer = bearer
 
     def publish(self, text: str, media_url: Optional[str] = None) -> PublishResult:
+        # Enforce length in case templates grow
+        MAX = 280
+        if len(text) > MAX:
+            text = text[: MAX - 1] + "…"
+    
         if DRY_RUN or not self.bearer:
             logger.info("[DRY] x | %s", text)
             return PublishResult({"platform": self.platform, "id": None, "text": text})
+
         # Note: This is a minimal v2 endpoint call. You must supply a valid user-context token.
         url = "https://api.twitter.com/2/tweets"
         headers = {"Authorization": f"Bearer {self.bearer}", "Content-Type": "application/json"}
@@ -640,6 +650,8 @@ async def lifespan(app: FastAPI):
     SCHED.add_job(run_upgrade_watcher, "interval", minutes=5)
     SCHED.start()
     logger.info("Bot started. DRY_RUN=%s, TZ=%s", DRY_RUN, TZ)
+    if ENABLE_X and not X_BEARER_TOKEN:
+        logger.warning("ENABLE_X=true but X_BEARER_TOKEN is empty — X posts will not publish.")
     try:
         yield
     finally:
