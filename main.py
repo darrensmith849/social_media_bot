@@ -650,6 +650,15 @@ async def lifespan(app: FastAPI):
     SCHED.add_job(run_upgrade_watcher, "interval", minutes=5)
     SCHED.start()
     logger.info("Bot started. DRY_RUN=%s, TZ=%s", DRY_RUN, TZ)
+
+    # If we're in DRY mode, kick an immediate rotation post on startup
+    if DRY_RUN:
+        try:
+            logger.info("DRY_RUN=true → firing immediate rotation post on startup")
+            run_rotation_post()
+        except Exception as e:
+            logger.exception("Startup DRY rotation failed: %s", e)
+
     if ENABLE_X and not X_BEARER_TOKEN:
         logger.warning("ENABLE_X=true but X_BEARER_TOKEN is empty — X posts will not publish.")
     try:
