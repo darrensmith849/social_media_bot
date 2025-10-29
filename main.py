@@ -74,7 +74,7 @@ import string
 from dataclasses import dataclass
 from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Callable
 
 import yaml
 import requests
@@ -118,6 +118,19 @@ X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
 
 # Fallback media
 FALLBACK_IMAGE_URL = os.getenv("FALLBACK_IMAGE_URL")
+
+# Minimal settings object used by publisher registry
+@dataclass(frozen=True)
+class Settings:
+    dry_run: bool
+    enable_x: bool
+    x_bearer_token: Optional[str]
+
+SET = Settings(
+    dry_run=DRY_RUN,
+    enable_x=ENABLE_X,
+    x_bearer_token=X_BEARER_TOKEN,
+)
 
 # ------------------
 # State DB (SQLite by default)
@@ -427,14 +440,14 @@ PUBLISHER_REGISTRY: dict[str, PublisherFactory] = {
     # "instagram": lambda s: InstagramPublisher(s.ig_token) if (not s.dry_run and s.enable_instagram) else None,
 }
 
-def build_publishers(sett: Settings = SET) -> list[Publisher]:
+def build_publishers(sett: Optional[Settings] = None) -> list[Publisher]:
+    sett = sett or SET
     pubs: list[Publisher] = []
-    for name, factory in PUBLISHER_REGISTRY.items():
+    for _, factory in PUBLISHER_REGISTRY.items():
         pub = factory(sett)
         if pub:
             pubs.append(pub)
     return pubs
-
 
 
 # ------------------
