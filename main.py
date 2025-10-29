@@ -257,14 +257,18 @@ class School:
 # Util functions
 # ------------------
 def ensure_bootstrap() -> None:
-    """Ensure state tables and default templates exist."""
+    """Ensure state tables and default templates exist (SQLite-safe, one statement at a time)."""
     with STATE_ENGINE.begin() as conn:
-        conn.exec_driver_sql(STATE_SCHEMA_SQL)
+        # Split on semicolons; ignore blanks. Works across SQLite/Postgres.
+        for stmt in [s.strip() for s in STATE_SCHEMA_SQL.split(";") if s.strip()]:
+            conn.exec_driver_sql(stmt)
+
     if not os.path.exists(TEMPLATES_PATH):
         os.makedirs(os.path.dirname(TEMPLATES_PATH), exist_ok=True)
         with open(TEMPLATES_PATH, "w", encoding="utf-8") as f:
             f.write(DEFAULT_TEMPLATES_YAML)
         logger.info("Wrote default templates to %s", TEMPLATES_PATH)
+
 
 
 def load_templates() -> Dict[str, Any]:
