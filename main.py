@@ -82,6 +82,8 @@ from jinja2 import Environment, BaseLoader, StrictUndefined
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
+
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -599,13 +601,11 @@ def run_upgrade_watcher():
 
 
 # ------------------
-# FastAPI app
+# FastAPI app (lifespan-based startup/shutdown)
 # ------------------
-app = FastAPI(title="SA Private Schools – Social Bot")
-
-
-@app.on_event("startup")
-def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     ensure_bootstrap()
     schedule_today_slots()
     # Rolling schedules
@@ -613,6 +613,18 @@ def on_startup():
     SCHED.add_job(run_upgrade_watcher, "interval", minutes=5)
     SCHED.start()
     logger.info("Bot started. DRY_RUN=%s, TZ=%s", DRY_RUN, TZ)
+    try:
+        yield
+    finally:
+        # Shutdown
+        try:
+            SCHED.shutdown(wait=False)
+            logger.info("Scheduler shut down cleanly.")
+        except Exception as e:
+            logger.warning("Scheduler shutdown warning: %s", e)
+
+app = FastAPI(title="SA Private Schools – Social Bot", lifespan=lifespan)
+
 
 
 @app.get("/health")
