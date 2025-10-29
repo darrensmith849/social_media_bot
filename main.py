@@ -661,6 +661,19 @@ def publish_now(school_id: str):
     results = publish_once(match, purpose="rotation")
     return {"published": results}
 
+@app.post("/publish/kick")
+def publish_kick():
+    """Pick an eligible school and publish once immediately (DRY shows in logs/Telegram)."""
+    schools = fetch_schools()
+    choice = choose_school_for_slot(schools) or next((s for s in schools if eligible_for_rotation(s)), None)
+    if not choice:
+        return JSONResponse(status_code=404, content={"error": "No eligible schools"})
+    results = publish_once(choice, purpose="rotation")
+    return {"published": results, "school": choice.name}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
 
 # ------------------
 # Optional: SQL view DDL (run in your main DB, not here)
