@@ -122,7 +122,13 @@ FALLBACK_IMAGE_URL = os.getenv("FALLBACK_IMAGE_URL")
 # ------------------
 # State DB (SQLite by default)
 # ------------------
-STATE_ENGINE: Engine = create_engine(STATE_DB_URL, future=True)
+def _create_state_engine(url: str) -> Engine:
+    # APScheduler uses background threads; SQLite needs check_same_thread=False
+    if url.startswith("sqlite:"):
+        return create_engine(url, future=True, connect_args={"check_same_thread": False})
+    return create_engine(url, future=True, pool_pre_ping=True)
+
+STATE_ENGINE: Engine = _create_state_engine(STATE_DB_URL)
 
 STATE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS published_posts (
@@ -135,12 +141,14 @@ CREATE TABLE IF NOT EXISTS published_posts (
   posted_at TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pp_school_month ON published_posts (school_id, posted_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pp_school_platform_text ON published_posts (school_id, platform, text_hash);
 
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT
 );
 """
+
 
 # ------------------
 # Templates bootstrap
@@ -330,11 +338,16 @@ def build_env() -> Environment:
 
 def select_template(templates: Dict[str, Any], school: School, purpose: str = "rotation") -> Dict[str, Any]:
     """Choose a template. For rotation, avoid using upgrade_announcement."""
-    candidates = [t for t in templates.values() if (purpose == "rotation" and t["key"] != "upgrade_announcement") or (purpose == "upgrade" and t["key"] == "upgrade_announcement")]
-    # Deterministic-ish choice per day & school to reduce repeats
-    seed = int(datetime.now(TZ).strftime("%Y%m%d")) + hash(school.id)
-    random.seed(seed)
-    return random.choice(candidates)
+    candidates = [
+        t for t in templates.values()
+        if (purpose == "rotation" and t["key"] != "upgrade_announcement")
+        or (purpose == "upgrade" and t["key"] == "upgrade_announcement")
+    ]
+    # Deterministic per-day choice without touching global RNG
+    seed = int(datetime.now(TZ).strftime("%Y%m%d")) ^ hash(school.id)
+    rng = random.Random(seed)
+    return rng.choice(candidates) if candidates else next(iter(templates.values()))
+
 
 
 def render_text(tpl_text: str, school: School) -> str:
@@ -405,13 +418,24 @@ class XPublisher(Publisher):
         return PublishResult({"platform": self.platform, "id": tweet_id, "text": text})
 
 
-def build_publishers() -> List[Publisher]:
-    pubs: List[Publisher] = []
-    # Always include console logger for visibility
-    pubs.append(ConsolePublisher())
-    if ENABLE_X:
-        pubs.append(XPublisher(X_BEARER_TOKEN))
+PublisherFactory = Callable[[Settings], Optional[Publisher]]
+
+PUBLISHER_REGISTRY: dict[str, PublisherFactory] = {
+    "console": lambda s: ConsolePublisher(),
+    "x": lambda s: None if (s.dry_run or not s.enable_x) else XPublisher(s.x_bearer_token),
+    # "facebook": lambda s: FacebookPublisher(s.fb_token) if (not s.dry_run and s.enable_facebook) else None,
+    # "instagram": lambda s: InstagramPublisher(s.ig_token) if (not s.dry_run and s.enable_instagram) else None,
+}
+
+def build_publishers(sett: Settings = SET) -> list[Publisher]:
+    pubs: list[Publisher] = []
+    for name, factory in PUBLISHER_REGISTRY.items():
+        pub = factory(sett)
+        if pub:
+            pubs.append(pub)
     return pubs
+
+
 
 # ------------------
 # Business rules (caps, cooldowns, eligibility)
@@ -439,17 +463,24 @@ def eligible_for_rotation(s: School) -> bool:
 # ------------------
 
 def choose_school_for_slot(schools: List[School]) -> Optional[School]:
-    """Fair rotation: filter eligible, remove cooldown, prioritise lowest monthly count, then random."""
+    """Fair rotation: eligible → not on cooldown → under cap → lowest monthly count → random tiebreak."""
     now = datetime.now(TZ)
     pool = [s for s in schools if eligible_for_rotation(s) and not already_posted_recently(s.id)]
     if not pool:
         return None
-    scored = [(monthly_count(s.id, now), s) for s in pool]
-    min_count = min(c for c, _ in scored)
-    shortlist = [s for c, s in scored if c == min_count and monthly_count(s.id, now) < PER_SCHOOL_MONTHLY_CAP]
-    if not shortlist:
+
+    # One COUNT per candidate
+    counts = {s.id: monthly_count(s.id, now) for s in pool}
+    pool = [s for s in pool if counts[s.id] < PER_SCHOOL_MONTHLY_CAP]
+    if not pool:
         return None
-    random.shuffle(shortlist)
+
+    min_count = min(counts[s.id] for s in pool)
+    shortlist = [s for s in pool if counts[s.id] == min_count]
+
+    # Day-based local RNG for stable tiebreaks (no global RNG effects)
+    rng = random.Random(now.strftime("%Y%m%d"))
+    rng.shuffle(shortlist)
     return shortlist[0]
 
 
@@ -522,20 +553,37 @@ def run_rotation_post():
 
 
 def run_upgrade_watcher():
-    """Every 5 minutes: detect new upgrades and announce immediately."""
+    """Every 5 minutes: detect new upgrades and announce immediately (TZ-safe)."""
     schools = [s for s in fetch_schools() if s.featured and not s.opt_out]
     if not schools:
         return
+
+    now = datetime.now(TZ)
     last_seen_iso = kget("last_seen_upgrade_ts")
-    last_seen = datetime.fromisoformat(last_seen_iso) if last_seen_iso else datetime.now(TZ) - timedelta(days=7)
-    new_upgrades = [s for s in schools if s.upgraded_at and s.upgraded_at.replace(tzinfo=TZ) > last_seen]
-    if not new_upgrades:
+    last_seen = datetime.fromisoformat(last_seen_iso) if last_seen_iso else (now - timedelta(days=7))
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=TZ)
+
+    pending: List[tuple[datetime, School]] = []
+    for s in schools:
+        ua = s.upgraded_at
+        if not ua:
+            continue
+        # Treat naive as local TZ rather than re-labelling aware times
+        if ua.tzinfo is None:
+            ua = ua.replace(tzinfo=TZ)
+        if ua > last_seen:
+            pending.append((ua, s))
+
+    if not pending:
         return
-    new_upgrades.sort(key=lambda s: s.upgraded_at)
-    for s in new_upgrades:
+
+    pending.sort(key=lambda t: t[0])
+    for ua, s in pending:
         logger.info("Announcing new Featured school: %s", s.name)
         publish_once(s, purpose="upgrade")
-        kset("last_seen_upgrade_ts", s.upgraded_at.replace(tzinfo=TZ).isoformat())
+        kset("last_seen_upgrade_ts", ua.astimezone(TZ).isoformat())
+
 
 # ------------------
 # FastAPI app
