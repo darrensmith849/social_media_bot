@@ -309,6 +309,41 @@ def kset(key: str, val: str) -> None:
 # ------------------
 MAIN_ENGINE: Optional[Engine] = None
 
+def _sample_schools_for_dry() -> List[School]:
+    """Fallback data so DRY mode can render even if DATABASE_URL is wrong/unavailable."""
+    now = datetime.now(TZ)
+    return [
+        School(
+            id="dry-1",
+            name="Greenwood Academy",
+            city="Cape Town",
+            province="Western Cape",
+            area=None,
+            phases=["Primary", "High"],
+            religion="Christian",
+            fees_min=45000,
+            fees_max=78000,
+            admissions_url="https://example.com/apply",
+            profile_url="https://saprivateschools.co.za/schools/greenwood",
+            subjects=["Mathematics", "Science", "English", "History"],
+            featured=True,
+            upgraded_at=now,
+            x_handle=None,
+            facebook_page_id=None,
+            instagram_username=None,
+            linkedin_url=None,
+            logo_url="https://cdn.example.com/greenwood-logo.png",
+            hero_image_url="https://cdn.example.com/greenwood-hero.jpg",
+            media_approved=True,
+            opt_out=False,
+            admissions_note="Now enrolling – enquire today.",
+            value_points=["Individual attention", "Strong academics", "Caring ethos"],
+            media_caption="beautiful campus",
+            open_day=None,
+        )
+    ]
+
+
 
 def get_main_engine() -> Engine:
     global MAIN_ENGINE
@@ -356,15 +391,33 @@ def row_to_school(row: Row) -> School:
 
 
 def fetch_schools() -> List[School]:
-    eng = get_main_engine()
+    # Handle missing/placeholder DATABASE_URL gracefully
+    if not DATABASE_URL or DATABASE_URL.strip() in {"", "(read-only)"}:
+        if DRY_RUN:
+            logger.warning("DATABASE_URL is unset/placeholder in DRY mode; using sample schools.")
+            return _sample_schools_for_dry()
+        raise RuntimeError("DATABASE_URL is not set to a valid SQLAlchemy URL")
+
+    try:
+        eng = get_main_engine()
+    except Exception as e:
+        if DRY_RUN:
+            logger.warning("Main DB unavailable in DRY mode (%s); using sample schools.", e)
+            return _sample_schools_for_dry()
+        logger.exception("Main DB unavailable: %s", e)
+        return []
+
     try:
         with eng.begin() as conn:
             rows = conn.execute(text(SCHOOLS_SQL)).mappings().all()
-            schools = [row_to_school(r) for r in rows]
-            return schools
-    except SQLAlchemyError as e:
+            return [row_to_school(r) for r in rows]
+    except Exception as e:
+        if DRY_RUN:
+            logger.warning("Fetch failed in DRY mode (%s); using sample schools.", e)
+            return _sample_schools_for_dry()
         logger.exception("Failed to fetch schools: %s", e)
         return []
+
 
 # ------------------
 # Template rendering
