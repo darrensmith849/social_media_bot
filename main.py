@@ -7,7 +7,7 @@ This file is a self-contained Python service you can deploy to Railway.
 It includes:
   • FastAPI app (health, dry-run preview, manual publish)
   • APScheduler jobs (daily rotation + upgrade announcements watcher)
-  • Read-only DB ingest (Postgres by default, configurable SQL)
+  • Read-only DB ingest (MySQL-ready; Postgres also works if you supply a URL)
   • Template engine (Jinja2) with sensible defaults written to templates.yaml on first run
   • Per-school monthly caps, de-duplication, and fair rotation
   • Pluggable publishers (Console + X/Twitter v2 skeleton). Add more easily (Facebook/Instagram/LinkedIn)
@@ -43,8 +43,8 @@ Python 3.11+ recommended (uses zoneinfo).
 ENV VARS (Railway project variables)
 -----------------
 # Core
-DATABASE_URL=postgresql+psycopg2://readonly:***@host:5432/dbname
-BOT_STATE_DB_URL=sqlite:////data/bot.db   # or postgres URL for state if you prefer
+DATABASE_URL=mysql+pymysql://readonly:***@host:3306/dbname
+BOT_SCHOOLS_SQL=SELECT * FROM bot_schools_v;   # override if your schema differs
 BOT_SCHOOLS_SQL=SELECT * FROM public.bot_schools_v;   # override if your schema differs
 TIMEZONE=Africa/Johannesburg
 DRY_RUN=true   # when true, only logs posts (still stores state)
@@ -108,7 +108,7 @@ BRAND_NAME = os.getenv("BRAND_NAME", "SA Private Schools")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 STATE_DB_URL = os.getenv("BOT_STATE_DB_URL", "sqlite:////data/bot.db")
-SCHOOLS_SQL = os.getenv("BOT_SCHOOLS_SQL", "SELECT * FROM public.bot_schools_v;")
+SCHOOLS_SQL = os.getenv("BOT_SCHOOLS_SQL", "SELECT * FROM bot_schools_v;")
 
 DAILY_SLOTS = [s.strip().strip('"').strip("'") for s in os.getenv("DAILY_SLOTS", "09:00,13:00,17:30").split(",") if s.strip()]
 POSTS_PER_SLOT = int(os.getenv("POSTS_PER_SLOT", "1"))
@@ -397,6 +397,7 @@ def fetch_schools() -> List[School]:
             logger.warning("DATABASE_URL is unset/placeholder in DRY mode; using sample schools.")
             return _sample_schools_for_dry()
         raise RuntimeError("DATABASE_URL is not set to a valid SQLAlchemy URL")
+        logger.warning("DATABASE_URL is unset/placeholder. Expect MySQL URL like: mysql+pymysql://user:pass@host:3306/dbname")
 
     try:
         eng = get_main_engine()
@@ -780,22 +781,23 @@ if __name__ == "__main__":
 # Optional: SQL view DDL (run in your main DB, not here)
 # ------------------
 DDL_EXAMPLE = r"""
--- Recommended view: unify the fields the bot reads
-CREATE OR REPLACE VIEW public.bot_schools_v AS
+-- Recommended MySQL view: unify the fields the bot reads
+-- Run this in your MySQL database (adjust table/column names as needed).
+CREATE OR REPLACE VIEW `bot_schools_v` AS
 SELECT
   s.id,
   s.name,
   s.city,
   s.province,
   s.area,
-  s.phases,                -- comma-separated list or array cast to text
+  s.phases,                -- CSV or JSON text is fine; the bot splits strings
   s.religion,
   s.fees_min,
   s.fees_max,
   s.admissions_url,
-  s.profile_url,           -- your SA Private Schools profile link with UTM if desired
-  s.subjects,              -- comma-separated list
-  s.featured,              -- boolean: upgraded/featured
+  s.profile_url,           -- your SA Private Schools profile link (add UTM if desired)
+  s.subjects,              -- CSV or JSON text
+  s.featured,              -- TINYINT(1) or BOOLEAN mapped to 0/1
   s.upgraded_at,
   s.x_handle,
   s.facebook_page_id,
@@ -803,15 +805,16 @@ SELECT
   s.linkedin_url,
   s.logo_url,
   s.hero_image_url,
-  COALESCE(s.media_approved, TRUE) AS media_approved,
-  COALESCE(s.opt_out, FALSE) AS opt_out,
+  COALESCE(s.media_approved, 1) AS media_approved,
+  COALESCE(s.opt_out, 0) AS opt_out,
   s.admissions_note,
   s.value_points,
   s.media_caption,
   s.open_day
-FROM public.schools s
-WHERE s.is_private = TRUE;  -- adjust to your schema
+FROM `schools` s
+WHERE s.is_private = 1;  -- adjust to your schema
 """
+
 
 # ------------------
 # Notes & Next steps
