@@ -293,6 +293,17 @@ def month_bounds(dt: datetime) -> Tuple[datetime, datetime]:
 def text_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+def already_recorded(school_id: str, platform: str, text_body: str) -> bool:
+    """Skip publishing if an identical post is already stored."""
+    th = text_hash(text_body)
+    with STATE_ENGINE.begin() as conn:
+        row = conn.execute(
+            text("SELECT 1 FROM published_posts WHERE school_id=:sid AND platform=:pf AND text_hash=:th LIMIT 1"),
+            {"sid": school_id, "pf": platform, "th": th},
+        ).fetchone()
+    return bool(row)
+
+
 
 def kget(key: str) -> Optional[str]:
     with STATE_ENGINE.begin() as conn:
@@ -311,23 +322,9 @@ MAIN_ENGINE: Optional[Engine] = None
 
 def _sample_schools_for_dry() -> List[School]:
     """Fallback data so DRY mode can render even if DATABASE_URL is wrong/unavailable."""
-    now = datetime.now(TZ)
-    return [
-        School(
-            id="dry-1",
-            name="Greenwood Academy",
-            city="Cape Town",
-            province="Western Cape",
-            area=None,
-            phases=["Primary", "High"],
-            religion="Christian",
-            fees_min=45000,
-            fees_max=78000,
-            admissions_url="https://example.com/apply",
-            profile_url="https://saprivateschools.co.za/schools/greenwood",
-            subjects=["Mathematics", "Science", "English", "History"],
-            featured=True,
-            upgraded_at=now,
+    # Use a fixed timestamp so the upgrade watcher doesn't re-trigger every run
+    upgraded_at=datetime(2025, 1, 1, tzinfo=TZ),
+
             x_handle=None,
             facebook_page_id=None,
             instagram_username=None,
@@ -608,7 +605,7 @@ def record_published(school_id: str, platform: str, template_key: str, text_body
         })
 
 
-def publish_once(s: School, purpose: str = "rotation") -> List[PublishResult]:
+def publish_once(s: School, purpose: str = "rotation", record_state: bool = True) -> List[PublishResult]:
     templates = load_templates()
     tpl = select_template(templates, s, purpose)
     text_body = render_text(tpl["text"], s)
@@ -618,9 +615,16 @@ def publish_once(s: School, purpose: str = "rotation") -> List[PublishResult]:
         # Only post to platforms present in template's platform list, except console.
         if isinstance(pub, ConsolePublisher) or pub.platform in tpl.get("platforms", []):
             try:
+                # Dedup: skip if identical post already recorded
+                if record_state and already_recorded(s.id, pub.platform, text_body):
+                    logger.info("Duplicate detected; skipping publish for %s | %s", s.name, pub.platform)
+                    continue
+                
                 res = pub.publish(text_body, media_url)
                 results.append(res)
-                record_published(s.id, pub.platform, tpl["key"], text_body, res.get("id"))
+                if record_state:
+                    record_published(s.id, pub.platform, tpl["key"], text_body, res.get("id"))
+
             except Exception as e:
                 logger.exception("Failed to publish to %s for school %s: %s", pub.platform, s.name, e)
     return results
@@ -649,13 +653,14 @@ def schedule_today_slots():
             logger.info("Scheduled rotation post at %s", run_at)
 
 
-def run_rotation_post():
+def run_rotation_post(record_state: bool = True):
     schools = fetch_schools()
     choice = choose_school_for_slot(schools)
     if not choice:
         logger.info("No eligible school for this slot.")
         return
-    publish_once(choice, purpose="rotation")
+    publish_once(choice, purpose="rotation", record_state=record_state)
+
 
 
 def run_upgrade_watcher():
@@ -701,17 +706,20 @@ async def lifespan(app: FastAPI):
     schedule_today_slots()
     # Rolling schedules
     SCHED.add_job(schedule_today_slots, "cron", hour=0, minute=5)  # schedule next day just after midnight
-    SCHED.add_job(run_upgrade_watcher, "interval", minutes=5)
+    # Don’t run upgrade announcements in DRY mode (avoids repeated “new” upgrades from sample data)
+    if not DRY_RUN:
+        SCHED.add_job(run_upgrade_watcher, "interval", minutes=5)
     SCHED.start()
     logger.info("Bot started. DRY_RUN=%s, TZ=%s", DRY_RUN, TZ)
-
-    # If we're in DRY mode, kick an immediate rotation post on startup
+    
+    # DRY preview on startup, without touching state
     if DRY_RUN:
         try:
-            logger.info("DRY_RUN=true → firing immediate rotation post on startup")
-            run_rotation_post()
+            logger.info("DRY_RUN=true → firing immediate rotation post on startup (no state record)")
+            run_rotation_post(record_state=False)
         except Exception as e:
             logger.exception("Startup DRY rotation failed: %s", e)
+
 
     if ENABLE_X and not X_BEARER_TOKEN:
         logger.warning("ENABLE_X=true but X_BEARER_TOKEN is empty — X posts will not publish.")
