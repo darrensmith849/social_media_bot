@@ -440,10 +440,31 @@ def fetch_schools() -> List[School]:
 def build_env() -> Environment:
     env = Environment(loader=BaseLoader(), autoescape=False, undefined=StrictUndefined)
     env.filters["slice"] = lambda seq, n: list(seq)[:n]
+
+    def _compact_grades(items):
+        grades = []
+        for x in items:
+            s = str(x).strip()
+            if s.lower().startswith("grade"):
+                parts = [p for p in s.split() if p.isdigit()]
+                if parts:
+                    grades.append(int(parts[0]))
+        if len(grades) >= 2:
+            return f"Grades {min(grades)}–{max(grades)}"
+        return None
+
     def join_filter(iterable, sep=", "):
-        return sep.join([str(x) for x in iterable])
+        items = [str(x).strip() for x in iterable if str(x).strip()]
+        # Special case: when templates use join('/') for phases, compact “Grade …” lists
+        if sep == "/" and items:
+            compact = _compact_grades(items)
+            if compact:
+                return compact
+        return sep.join(items)
+
     env.filters["join"] = join_filter
     return env
+
 
 
 
@@ -470,10 +491,10 @@ def render_text(tpl_text: str, school: School) -> str:
         "area": school.area or "",
         "phases": school.phases or [],
         "religion": school.religion or "",
-        "fees_min": school.fees_min if school.fees_min is not None else "N/A",
-        "fees_max": school.fees_max if school.fees_max is not None else "N/A",
+        "fees_min": school.fees_min if (school.fees_min not in (None, 0)) else "N/A",
+        "fees_max": school.fees_max if (school.fees_max not in (None, 0)) else "N/A",
         "admissions_url": school.admissions_url,
-        "profile_url": school.profile_url,
+        "profile_url": f"{school.profile_url}?utm_source=console&utm_medium={'dryrun' if DRY_RUN else 'live'}&utm_campaign=rotation" if school.profile_url else "",
         "subjects": school.subjects or [],
         "admissions_note": school.admissions_note or "Now enrolling – enquire today.",
         "value_points": school.value_points or ["Individual attention", "Strong academics", "Caring ethos"],
