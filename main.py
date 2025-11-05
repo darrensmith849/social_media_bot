@@ -322,9 +322,23 @@ MAIN_ENGINE: Optional[Engine] = None
 
 def _sample_schools_for_dry() -> List[School]:
     """Fallback data so DRY mode can render even if DATABASE_URL is wrong/unavailable."""
-    # Use a fixed timestamp so the upgrade watcher doesn't re-trigger every run
-    upgraded_at=datetime(2025, 1, 1, tzinfo=TZ),
-
+    fixed_upgraded = datetime(2025, 1, 1, tzinfo=TZ)
+    return [
+        School(
+            id="dry-1",
+            name="Greenwood Academy",
+            city="Cape Town",
+            province="Western Cape",
+            area="Southern Suburbs",
+            phases=["Primary", "High"],
+            religion="Christian",
+            fees_min=45000,
+            fees_max=95000,
+            admissions_url="https://example.com/apply",
+            profile_url="https://saprivateschools.co.za/schools/greenwood",
+            subjects=["Mathematics", "Science", "English"],
+            featured=True,
+            upgraded_at=fixed_upgraded,
             x_handle=None,
             facebook_page_id=None,
             instagram_username=None,
@@ -339,6 +353,7 @@ def _sample_schools_for_dry() -> List[School]:
             open_day=None,
         )
     ]
+
 
 
 
@@ -773,13 +788,14 @@ def publish_now(school_id: str):
 
 @app.post("/publish/kick")
 def publish_kick():
-    """Pick an eligible school and publish once immediately (DRY shows in logs/Telegram)."""
+    """Pick an eligible school and publish once immediately (DRY shows in logs)."""
     schools = fetch_schools()
     choice = choose_school_for_slot(schools) or next((s for s in schools if eligible_for_rotation(s)), None)
     if not choice:
         return JSONResponse(status_code=404, content={"error": "No eligible schools"})
-    results = publish_once(choice, purpose="rotation")
+    results = publish_once(choice, purpose="rotation", record_state=not DRY_RUN)
     return {"published": results, "school": choice.name}
+
 
 if __name__ == "__main__":
     import uvicorn
