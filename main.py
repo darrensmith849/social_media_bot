@@ -6,7 +6,7 @@ SA Private Schools – Social Bot (Railway-ready Python service)
 This file is a self-contained Python service you can deploy to Railway.
 It includes:
   • FastAPI app (health, dry-run preview, manual publish)
-  • APScheduler jobs (daily rotation + upgrade announcements watcher)
+  • APScheduler jobs (daily rotation + upgrade announcements watcher) 
   • Read-only DB ingest (MySQL-ready; Postgres also works if you supply a URL)
   • Template engine (Jinja2) with sensible defaults written to templates.yaml on first run
   • Per-school monthly caps, de-duplication, and fair rotation
