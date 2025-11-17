@@ -439,7 +439,13 @@ def fetch_schools() -> List[School]:
 @lru_cache(maxsize=1)
 def build_env() -> Environment:
     env = Environment(loader=BaseLoader(), autoescape=False, undefined=StrictUndefined)
-    env.filters["slice"] = lambda seq, n: list(seq)[:n]
+
+    # NOTE:
+    # Jinja's built-in `slice` filter is an environment filter, so Jinja
+    # always calls it as `slice(env, value, arg, ...)`.
+    # Because we're overriding that name, our replacement must accept
+    # the environment as the first positional argument.
+    env.filters["slice"] = lambda _env, seq, n: list(seq)[:n]
 
     def _compact_grades(items):
         grades = []
@@ -464,6 +470,7 @@ def build_env() -> Environment:
 
     env.filters["join"] = join_filter
     return env
+
 
 
 
