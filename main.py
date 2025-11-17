@@ -119,8 +119,17 @@ COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "14"))
 ENABLE_X = os.getenv("ENABLE_X", "false").lower() == "true"
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
 
+# Telegram + AI approval settings
+TELEGRAM_APPROVAL_ENABLED = os.getenv("TELEGRAM_APPROVAL_ENABLED", "false").lower() == "true"
+TELEGRAM_PREVIEW_ON_STARTUP = os.getenv("TELEGRAM_PREVIEW_ON_STARTUP", "false").lower() == "true"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
 # Fallback media
 FALLBACK_IMAGE_URL = os.getenv("FALLBACK_IMAGE_URL")
+
 
 # Minimal settings object used by publisher registry
 @dataclass(frozen=True)
@@ -648,29 +657,53 @@ def record_published(school_id: str, platform: str, template_key: str, text_body
         })
 
 
-def publish_once(s: School, purpose: str = "rotation", record_state: bool = True) -> List[PublishResult]:
-    templates = load_templates()
-    tpl = select_template(templates, s, purpose)
-    text_body = render_text(tpl["text"], s)
-    media_url = pick_media(s)
+def publish_text_for_school(
+    s: School,
+    text_body: str,
+    media_url: Optional[str],
+    template_key: str,
+    platforms: Optional[List[str]] = None,
+    record_state: bool = True,
+) -> List[PublishResult]:
+    """
+    Core publishing helper: given a fixed text + media + target platforms,
+    run all publishers and optionally record state.
+    """
     results: List[PublishResult] = []
     for pub in build_publishers():
         # Only post to platforms present in template's platform list, except console.
-        if isinstance(pub, ConsolePublisher) or pub.platform in tpl.get("platforms", []):
+        if isinstance(pub, ConsolePublisher) or not platforms or pub.platform in platforms:
             try:
                 # Dedup: skip if identical post already recorded
                 if record_state and already_recorded(s.id, pub.platform, text_body):
                     logger.info("Duplicate detected; skipping publish for %s | %s", s.name, pub.platform)
                     continue
-                
+
                 res = pub.publish(text_body, media_url)
                 results.append(res)
                 if record_state:
-                    record_published(s.id, pub.platform, tpl["key"], text_body, res.get("id"))
+                    record_published(s.id, pub.platform, template_key, text_body, res.get("id"))
 
             except Exception as e:
                 logger.exception("Failed to publish to %s for school %s: %s", pub.platform, s.name, e)
     return results
+
+
+def publish_once(s: School, purpose: str = "rotation", record_state: bool = True) -> List[PublishResult]:
+    templates = load_templates()
+    tpl = select_template(templates, s, purpose)
+    text_body = render_text(tpl["text"], s)
+    media_url = pick_media(s)
+    platforms = tpl.get("platforms", [])
+    return publish_text_for_school(
+        s=s,
+        text_body=text_body,
+        media_url=media_url,
+        template_key=tpl["key"],
+        platforms=platforms,
+        record_state=record_state,
+    )
+
 
 # ------------------
 # Schedules
@@ -702,7 +735,15 @@ def run_rotation_post(record_state: bool = True):
     if not choice:
         logger.info("No eligible school for this slot.")
         return
-    publish_once(choice, purpose="rotation", record_state=record_state)
+
+    # Delegate to Telegram approval layer if available; otherwise fall back to direct publish.
+    try:
+        from telegram_approval import handle_scheduled_post
+        handle_scheduled_post(choice, purpose="rotation", record_state=record_state)
+    except ImportError:
+        logger.warning("telegram_approval module not found; falling back to direct publish.")
+        publish_once(choice, purpose="rotation", record_state=record_state)
+
 
 
 
@@ -755,11 +796,14 @@ async def lifespan(app: FastAPI):
     SCHED.start()
     logger.info("Bot started. DRY_RUN=%s, TZ=%s", DRY_RUN, TZ)
     
-    # DRY preview on startup, without touching state
-    if DRY_RUN:
+    # Preview on startup, without touching published_posts state.
+    # - In DRY_RUN: always do it (as before)
+    # - In live mode: only when TELEGRAM_PREVIEW_ON_STARTUP=true
+    if DRY_RUN or TELEGRAM_PREVIEW_ON_STARTUP:
         try:
-            logger.info("DRY_RUN=true → firing immediate rotation post on startup (no state record)")
+            logger.info("Startup preview → firing immediate rotation post (no state record)")
             run_rotation_post(record_state=False)
+
         except Exception as e:
             logger.exception("Startup DRY rotation failed: %s", e)
 
@@ -825,9 +869,22 @@ def publish_kick():
     return {"published": results, "school": choice.name}
 
 
+@app.post("/telegram/webhook")
+async def telegram_webhook(update: Dict[str, Any]):
+    """Telegram webhook endpoint for approval buttons + custom prompts."""
+    try:
+        from telegram_approval import handle_telegram_update
+        handle_telegram_update(update)
+    except Exception as e:
+        logger.exception("Telegram webhook handling failed: %s", e)
+    # Telegram only needs a 200 OK.
+    return {"ok": True}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
 
 # ------------------
 # Optional: SQL view DDL (run in your main DB, not here)
