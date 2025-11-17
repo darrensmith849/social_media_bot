@@ -122,7 +122,8 @@ X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
 # Telegram + AI approval settings
 TELEGRAM_APPROVAL_ENABLED = os.getenv("TELEGRAM_APPROVAL_ENABLED", "false").lower() == "true"
 TELEGRAM_PREVIEW_ON_STARTUP = os.getenv("TELEGRAM_PREVIEW_ON_STARTUP", "false").lower() == "true"
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Support both TELEGRAM_BOT_TOKEN and TELEGRAM_TOKEN env names
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
