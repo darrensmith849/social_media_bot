@@ -1,78 +1,37 @@
 #main.py
 
 """
-SA Private Schools – Social Bot (Railway-ready Python service)
+Universal Agency Bot (Railway-ready Python service)
 
 This file is a self-contained Python service you can deploy to Railway.
 It includes:
   • FastAPI app (health, dry-run preview, manual publish)
-  • APScheduler jobs (daily rotation + upgrade announcements watcher) 
-  • Read-only DB ingest (MySQL-ready; Postgres also works if you supply a URL)
-  • Template engine (Jinja2) with sensible defaults written to templates.yaml on first run
-  • Per-school monthly caps, de-duplication, and fair rotation
-  • Pluggable publishers (Console + X/Twitter v2 skeleton). Add more easily (Facebook/Instagram/LinkedIn)
-  • Local SQLite state (works on Railway Volume) so your main DB can stay READ ONLY
-
------------------
-Quick start on Railway
------------------
-1) Create a new service from this file.
-2) Add a Railway Volume and mount to `/data` (or use a separate Postgres for state).
-3) Set ENV VARS (see ENV VARS section below). Start command:
-      uvicorn main:app --host 0.0.0.0 --port ${PORT}
-4) Provide a READ-ONLY `DATABASE_URL` to your main school directory DB.
-5) (Optional) Create a view `public.bot_schools_v` in your main DB matching the DDL at bottom, or set BOT_SCHOOLS_SQL to your schema.
-6) Visit `/dry-run?count=5` to preview posts before enabling real publishing.
-
------------------
-Requirements (add to requirements.txt)
------------------
-fastapi==0.115.5
-uvicorn[standard]==0.32.0
-SQLAlchemy==2.0.36
-psycopg2-binary==2.9.9
-APScheduler==3.10.4
-Jinja2==3.1.4
-PyYAML==6.0.2
-requests==2.32.3
-python-dateutil==2.9.0.post0
-
-Python 3.11+ recommended (uses zoneinfo).
+  • APScheduler jobs (daily rotation) 
+  • Read-only DB ingest (Generic 'clients' table with JSON attributes)
+  • Template engine (Jinja2) implementing the 4-1-1 Rule
+  • Pluggable publishers (Console + X/Twitter v2 skeleton)
+  • Local SQLite state (works on Railway Volume)
 
 -----------------
 ENV VARS (Railway project variables)
 -----------------
-# Core
 DATABASE_URL=mysql+pymysql://readonly:***@host:3306/dbname
-BOT_SCHOOLS_SQL=SELECT * FROM bot_schools_v;   # override if your schema differs
-BOT_SCHOOLS_SQL=SELECT * FROM public.bot_schools_v;   # override if your schema differs
+BOT_CLIENTS_SQL=SELECT * FROM bot_clients_v;   # view returning id, name, industry, attributes (json)
 TIMEZONE=Africa/Johannesburg
-DRY_RUN=true   # when true, only logs posts (still stores state)
-
-# Cadence
-DAILY_SLOTS="09:00,13:00,17:30"   # local times
-POSTS_PER_SLOT=1
-PER_SCHOOL_MONTHLY_CAP=2
-COOLDOWN_DAYS=14
-
-# Platform toggles
+DRY_RUN=true
+DAILY_SLOTS="09:00,13:00,17:30"
+PER_CLIENT_MONTHLY_CAP=12
 ENABLE_X=false
-# X/Twitter v2 (user-context OAuth token capable of posting)
-X_BEARER_TOKEN=   # if set and ENABLE_X=true, will publish real tweets
-
-# Branding and fallbacks
-BRAND_NAME="SA Private Schools"
-FALLBACK_IMAGE_URL=   # optional branded card URL if school has no media
-
+X_BEARER_TOKEN=
 """
 from __future__ import annotations
 import os
 import logging
 import hashlib
 import random
-import string
-from dataclasses import dataclass
-from datetime import datetime, date, time, timedelta
+import json
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Optional, Dict, Any, Tuple, Callable
 
@@ -85,35 +44,32 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
-
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, Row, make_url
-from sqlalchemy.exc import SQLAlchemyError
 
 # ------------------
 # Logging setup
 # ------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger("sa-private-schools-bot")
+logger = logging.getLogger("agency-bot")
 
 # ------------------
 # Config helpers
 # ------------------
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Africa/Johannesburg"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-BRAND_NAME = os.getenv("BRAND_NAME", "SA Private Schools")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 STATE_DB_URL = os.getenv("BOT_STATE_DB_URL", "sqlite:////data/bot.db")
-SCHOOLS_SQL = os.getenv("BOT_SCHOOLS_SQL", "SELECT * FROM bot_schools_v;")
+CLIENTS_SQL = os.getenv("BOT_CLIENTS_SQL", "SELECT * FROM bot_clients_v;")
 
 DAILY_SLOTS = [s.strip().strip('"').strip("'") for s in os.getenv("DAILY_SLOTS", "09:00,13:00,17:30").split(",") if s.strip()]
 POSTS_PER_SLOT = int(os.getenv("POSTS_PER_SLOT", "1"))
-PER_SCHOOL_MONTHLY_CAP = int(os.getenv("PER_SCHOOL_MONTHLY_CAP", "2"))
-COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "14"))
+PER_CLIENT_MONTHLY_CAP = int(os.getenv("PER_CLIENT_MONTHLY_CAP", "12"))
+COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "3"))
 
 # Platform toggles
 ENABLE_X = os.getenv("ENABLE_X", "false").lower() == "true"
@@ -122,63 +78,43 @@ X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
 # Telegram + AI approval settings
 TELEGRAM_APPROVAL_ENABLED = os.getenv("TELEGRAM_APPROVAL_ENABLED", "false").lower() == "true"
 TELEGRAM_PREVIEW_ON_STARTUP = os.getenv("TELEGRAM_PREVIEW_ON_STARTUP", "false").lower() == "true"
-# Support both TELEGRAM_BOT_TOKEN and TELEGRAM_TOKEN env names
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Fallback media
 FALLBACK_IMAGE_URL = os.getenv("FALLBACK_IMAGE_URL")
 
-
-# Minimal settings object used by publisher registry
 @dataclass(frozen=True)
 class Settings:
     dry_run: bool
     enable_x: bool
     x_bearer_token: Optional[str]
 
-SET = Settings(
-    dry_run=DRY_RUN,
-    enable_x=ENABLE_X,
-    x_bearer_token=X_BEARER_TOKEN,
-)
+SET = Settings(dry_run=DRY_RUN, enable_x=ENABLE_X, x_bearer_token=X_BEARER_TOKEN)
 
 # ------------------
-# State DB (SQLite by default)
+# State DB
 # ------------------
 def _create_state_engine(url: str) -> Engine:
-    # APScheduler uses background threads; SQLite needs check_same_thread=False
     if url.startswith("sqlite:"):
-        try:
-            u = make_url(url)
-            db_path = u.database
-            if db_path and db_path != ":memory:":
-                os.makedirs(os.path.dirname(db_path), exist_ok=True)
-            return create_engine(url, future=True, connect_args={"check_same_thread": False})
-        except Exception as e:
-            fallback = "sqlite:////tmp/bot.db"
-            os.makedirs("/tmp", exist_ok=True)
-            logger.warning("State DB '%s' unavailable (%s). Falling back to %s", url, e, fallback)
-            return create_engine(fallback, future=True, connect_args={"check_same_thread": False})
+        return create_engine(url, future=True, connect_args={"check_same_thread": False})
     return create_engine(url, future=True, pool_pre_ping=True)
-
 
 STATE_ENGINE: Engine = _create_state_engine(STATE_DB_URL)
 
 STATE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS published_posts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  school_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
   platform TEXT NOT NULL,
   template_key TEXT NOT NULL,
   text_hash TEXT NOT NULL,
   external_id TEXT,
   posted_at TIMESTAMP NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_pp_school_month ON published_posts (school_id, posted_at);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_pp_school_platform_text ON published_posts (school_id, platform, text_hash);
+CREATE INDEX IF NOT EXISTS idx_pp_client_month ON published_posts (client_id, posted_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pp_client_platform_text ON published_posts (client_id, platform, text_hash);
 
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
@@ -186,9 +122,8 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 """
 
-
 # ------------------
-# Templates bootstrap
+# Templates (The 4-1-1 Implementation)
 # ------------------
 def _templates_path_from_state(url: str) -> str:
     try:
@@ -205,82 +140,87 @@ def _templates_path_from_state(url: str) -> str:
 TEMPLATES_PATH = _templates_path_from_state(STATE_DB_URL)
 
 DEFAULT_TEMPLATES_YAML = """
+# The 4-1-1 Rule Categories:
+# 4 x Educational/Entertaining (Value)
+# 1 x Soft Sell (Trust)
+# 1 x Hard Sell (Conversion)
+
 post_templates:
-  - key: general_spotlight_short
+  # --- EDUCATIONAL / VALUE (Indices 0, 1, 2, 3) ---
+  - key: edu_tip
+    category: educational
     platforms: [x, facebook, linkedin]
-    text: "Featured private school in {{ city }}, {{ province }}: {{ name }} — {{ phases|join('/') }}. Fees {{ fees_min }}–{{ fees_max }} p.a. Enquire: {{ profile_url }}"
-  - key: general_spotlight_alt
+    text: "💡 Tip from {{ name }}: {{ attributes.tips|random if attributes.tips else 'Did you know? Consistency is key to success.' }} #{{ industry|replace(' ','') }} #{{ city|replace(' ','') }}"
+
+  - key: edu_mythbuster
+    category: educational
     platforms: [x, facebook, linkedin]
-    text: "Discover {{ name }} ({{ phases|join('/') }}) in {{ city }}. Faith: {{ religion }}. Subjects: {{ subjects|slice(0,3)|join(', ') }}… Details & enquiries: {{ profile_url }}"
-  - key: admissions_focus
+    text: "Common myth about {{ industry }}: {{ attributes.myths|random if attributes.myths else 'Most people think it is expensive, but it saves you money in the long run.' }} 🚫 Truth: {{ name }} makes it easy."
+
+  - key: edu_question
+    category: educational
     platforms: [x, facebook, linkedin]
-    text: "Admissions at {{ name }}: {{ admissions_note }} Apply or enquire here: {{ admissions_url or profile_url }}"
-  - key: value_highlight
+    text: "Question for our {{ city }} friends: What is your biggest challenge with {{ industry }} right now? 👇 let us know below!"
+
+  - key: edu_didyouknow
+    category: educational
     platforms: [x, facebook, linkedin]
-    text: "Why parents choose {{ name }} in {{ city }}: {{ value_points|join(' • ') }}. Fees from {{ fees_min }} p.a. Learn more: {{ profile_url }}"
-  - key: religion_subjects
+    text: "Did you know? {{ attributes.facts|random if attributes.facts else 'We have been serving ' + city + ' for years.' }} 🌍"
+
+  # --- SOFT SELL (Index 4) ---
+  - key: soft_team
+    category: soft_sell
     platforms: [x, facebook, linkedin]
-    text: "{{ name }} • {{ religion }} ethos • Popular subjects: {{ subjects|slice(0,5)|join(', ') }}. See fees & admissions: {{ profile_url }}"
-  - key: media_spotlight
+    text: "Meet the team behind {{ name }} in {{ city }}! We are passionate about {{ industry }} and helping our community. 👋 {{ attributes.website }}"
+
+  - key: soft_behind_scenes
+    category: soft_sell
     platforms: [x, facebook, linkedin]
-    text: "Take a look at {{ name }} in {{ city }} — {{ media_caption }}. Explore the school: {{ profile_url }}"
-  - key: upgrade_announcement
+    text: "Behind the scenes at {{ name }}... We are busy making things happen for our clients today! 🛠️"
+
+  # --- HARD SELL (Index 5) ---
+  - key: hard_cta
+    category: hard_sell
     platforms: [x, facebook, linkedin]
-    text: "🎉 Welcome to our Featured family: {{ name }} in {{ city }}! Featured schools get priority placement and instant parent enquiries. See the profile: {{ profile_url }} #SAPrivateSchools"
-  - key: open_day
+    text: "Ready to get started? 🚀 Join {{ name }} today. {{ attributes.offer_text or 'Contact us for a quote.' }} 👉 {{ attributes.admissions_url or attributes.website }}"
+
+  - key: hard_urgency
+    category: hard_sell
     platforms: [x, facebook, linkedin]
-    text: "Open day at {{ name }}{{ ' on ' + open_day if open_day else '' }}. Book your spot: {{ admissions_url or profile_url }}"
+    text: "Don't wait! Slots are filling up at {{ name }}. Secure your spot now: {{ attributes.admissions_url or attributes.website }}"
 """
 
 # ------------------
 # Data model
 # ------------------
 @dataclass
-class School:
+class Client:
     id: str
     name: str
+    industry: str
     city: str
-    province: str
-    area: Optional[str]
-    phases: List[str]
-    religion: Optional[str]
-    fees_min: Optional[int]
-    fees_max: Optional[int]
-    admissions_url: Optional[str]
-    profile_url: str
-    subjects: List[str]
-    featured: bool
-    upgraded_at: Optional[datetime]
-    x_handle: Optional[str]
-    facebook_page_id: Optional[str]
-    instagram_username: Optional[str]
-    linkedin_url: Optional[str]
-    logo_url: Optional[str]
-    hero_image_url: Optional[str]
-    media_approved: bool
-    opt_out: bool
-    admissions_note: Optional[str] = None
-    value_points: Optional[List[str]] = None
-    media_caption: Optional[str] = None
-    open_day: Optional[str] = None
+    attributes: Dict[str, Any] = field(default_factory=dict)
+    # attributes usually contains: website, phone, email, negative_constraints, tone, tips (list), myths (list)
+    
+    @property
+    def media_approved(self) -> bool:
+        return self.attributes.get("media_approved", True)
+
+    @property
+    def opt_out(self) -> bool:
+        return self.attributes.get("opt_out", False)
 
 # ------------------
 # Util functions
 # ------------------
 def ensure_bootstrap() -> None:
-    """Ensure state tables and default templates exist (SQLite-safe, one statement at a time)."""
     with STATE_ENGINE.begin() as conn:
-        # Split on semicolons; ignore blanks. Works across SQLite/Postgres.
         for stmt in [s.strip() for s in STATE_SCHEMA_SQL.split(";") if s.strip()]:
             conn.exec_driver_sql(stmt)
-
     if not os.path.exists(TEMPLATES_PATH):
         os.makedirs(os.path.dirname(TEMPLATES_PATH), exist_ok=True)
         with open(TEMPLATES_PATH, "w", encoding="utf-8") as f:
             f.write(DEFAULT_TEMPLATES_YAML)
-        logger.info("Wrote default templates to %s", TEMPLATES_PATH)
-
-
 
 def load_templates() -> Dict[str, Any]:
     with open(TEMPLATES_PATH, "r", encoding="utf-8") as f:
@@ -290,7 +230,6 @@ def load_templates() -> Dict[str, Any]:
         tpl_map[item["key"]] = item
     return tpl_map
 
-
 def month_bounds(dt: datetime) -> Tuple[datetime, datetime]:
     start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     if start.month == 12:
@@ -299,73 +238,51 @@ def month_bounds(dt: datetime) -> Tuple[datetime, datetime]:
         end = start.replace(month=start.month + 1)
     return start, end
 
-
 def text_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def already_recorded(school_id: str, platform: str, text_body: str) -> bool:
-    """Skip publishing if an identical post is already stored."""
+def already_recorded(client_id: str, platform: str, text_body: str) -> bool:
     th = text_hash(text_body)
     with STATE_ENGINE.begin() as conn:
         row = conn.execute(
-            text("SELECT 1 FROM published_posts WHERE school_id=:sid AND platform=:pf AND text_hash=:th LIMIT 1"),
-            {"sid": school_id, "pf": platform, "th": th},
+            text("SELECT 1 FROM published_posts WHERE client_id=:cid AND platform=:pf AND text_hash=:th LIMIT 1"),
+            {"cid": client_id, "pf": platform, "th": th},
         ).fetchone()
     return bool(row)
 
-
-
-def kget(key: str) -> Optional[str]:
-    with STATE_ENGINE.begin() as conn:
-        row = conn.execute(text("SELECT v FROM kv WHERE k=:k"), {"k": key}).fetchone()
-        return row[0] if row else None
-
-
-def kset(key: str, val: str) -> None:
-    with STATE_ENGINE.begin() as conn:
-        conn.execute(text("INSERT INTO kv(k,v) VALUES(:k,:v) ON CONFLICT(k) DO UPDATE SET v=excluded.v"), {"k": key, "v": val})
-
 # ------------------
-# DB ingest (read-only main DB)
+# DB ingest
 # ------------------
 MAIN_ENGINE: Optional[Engine] = None
 
-def _sample_schools_for_dry() -> List[School]:
-    """Fallback data so DRY mode can render even if DATABASE_URL is wrong/unavailable."""
-    fixed_upgraded = datetime(2025, 1, 1, tzinfo=TZ)
+def _sample_clients_for_dry() -> List[Client]:
     return [
-        School(
+        Client(
             id="dry-1",
-            name="Greenwood Academy",
+            name="Joe's Gym",
+            industry="Fitness",
             city="Cape Town",
-            province="Western Cape",
-            area="Southern Suburbs",
-            phases=["Primary", "High"],
-            religion="Christian",
-            fees_min=45000,
-            fees_max=95000,
-            admissions_url="https://example.com/apply",
-            profile_url="https://saprivateschools.co.za/schools/greenwood",
-            subjects=["Mathematics", "Science", "English"],
-            featured=True,
-            upgraded_at=fixed_upgraded,
-            x_handle=None,
-            facebook_page_id=None,
-            instagram_username=None,
-            linkedin_url=None,
-            logo_url="https://cdn.example.com/greenwood-logo.png",
-            hero_image_url="https://cdn.example.com/greenwood-hero.jpg",
-            media_approved=True,
-            opt_out=False,
-            admissions_note="Now enrolling – enquire today.",
-            value_points=["Individual attention", "Strong academics", "Caring ethos"],
-            media_caption="beautiful campus",
-            open_day=None,
+            attributes={
+                "website": "https://joesgym.co.za",
+                "tips": ["Drink water!", "Never skip leg day."],
+                "negative_constraints": "Do not mention steroids. Do not use slang.",
+                "tone": "High Energy",
+                "offer_text": "Get 50% off your first month!"
+            }
+        ),
+        Client(
+            id="dry-2",
+            name="Smile Dental",
+            industry="Healthcare",
+            city="Sandton",
+            attributes={
+                "website": "https://smiledental.co.za",
+                "tips": ["Floss daily.", "Brush twice a day."],
+                "negative_constraints": "No blood or scary needles.",
+                "tone": "Professional and Gentle"
+            }
         )
     ]
-
-
-
 
 def get_main_engine() -> Engine:
     global MAIN_ENGINE
@@ -375,148 +292,94 @@ def get_main_engine() -> Engine:
         MAIN_ENGINE = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
     return MAIN_ENGINE
 
+def row_to_client(row: Row) -> Client:
+    """
+    Converts DB row to Client. 
+    If 'attributes' column is missing, it packs unknown columns into the dict.
+    """
+    row_dict = dict(row)
+    c_id = str(row_dict.pop("id"))
+    c_name = row_dict.pop("name")
+    c_city = row_dict.pop("city", "South Africa")
+    c_industry = row_dict.pop("industry", "General")
+    
+    # Extract attributes (handle generic JSON column or pack loose columns)
+    attrs = {}
+    if "attributes" in row_dict and row_dict["attributes"]:
+        if isinstance(row_dict["attributes"], str):
+            try:
+                attrs = json.loads(row_dict["attributes"])
+            except:
+                pass
+        elif isinstance(row_dict["attributes"], dict):
+            attrs = row_dict["attributes"]
+    
+    # Merge remaining columns into attributes if not already present
+    for k, v in row_dict.items():
+        if k != "attributes" and k not in attrs:
+            attrs[k] = v
+            
+    return Client(id=c_id, name=c_name, industry=c_industry, city=c_city, attributes=attrs)
 
-def row_to_school(row: Row) -> School:
-    def split_list(val: Optional[str]) -> List[str]:
-        if not val:
-            return []
-        return [x.strip() for x in str(val).replace(";", ",").split(",") if x.strip()]
-
-    return School(
-        id=str(row["id"]),
-        name=row["name"],
-        city=row.get("city") or "",
-        province=row.get("province") or "",
-        area=row.get("area"),
-        phases=split_list(row.get("phases")),
-        religion=row.get("religion"),
-        fees_min=(int(row["fees_min"]) if row.get("fees_min") is not None else None),
-        fees_max=(int(row["fees_max"]) if row.get("fees_max") is not None else None),
-        admissions_url=row.get("admissions_url"),
-        profile_url=row.get("profile_url") or "",
-        subjects=split_list(row.get("subjects")),
-        featured=bool(row.get("featured") or row.get("upgraded") or row.get("is_featured")),
-        upgraded_at=(row.get("upgraded_at") or row.get("featured_at")),
-        x_handle=row.get("x_handle") or row.get("twitter_handle"),
-        facebook_page_id=row.get("facebook_page_id"),
-        instagram_username=row.get("instagram_username"),
-        linkedin_url=row.get("linkedin_url"),
-        logo_url=row.get("logo_url"),
-        hero_image_url=row.get("hero_image_url"),
-        media_approved=bool(row.get("media_approved") if row.get("media_approved") is not None else True),
-        opt_out=bool(row.get("opt_out") if row.get("opt_out") is not None else False),
-        admissions_note=row.get("admissions_note"),
-        value_points=split_list(row.get("value_points")),
-        media_caption=row.get("media_caption"),
-        open_day=row.get("open_day"),
-    )
-
-
-def fetch_schools() -> List[School]:
-    # Handle missing/placeholder DATABASE_URL gracefully
-    if not DATABASE_URL or DATABASE_URL.strip() in {"", "(read-only)"}:
-        if DRY_RUN:
-            logger.warning("DATABASE_URL is unset/placeholder in DRY mode; using sample schools.")
-            return _sample_schools_for_dry()
-        raise RuntimeError("DATABASE_URL is not set to a valid SQLAlchemy URL")
-        logger.warning("DATABASE_URL is unset/placeholder. Expect MySQL URL like: mysql+pymysql://user:pass@host:3306/dbname")
-
+def fetch_clients() -> List[Client]:
+    if not DATABASE_URL:
+        return _sample_clients_for_dry() if DRY_RUN else []
+    
     try:
         eng = get_main_engine()
-    except Exception as e:
-        if DRY_RUN:
-            logger.warning("Main DB unavailable in DRY mode (%s); using sample schools.", e)
-            return _sample_schools_for_dry()
-        logger.exception("Main DB unavailable: %s", e)
-        return []
-
-    try:
         with eng.begin() as conn:
-            rows = conn.execute(text(SCHOOLS_SQL)).mappings().all()
-            return [row_to_school(r) for r in rows]
+            rows = conn.execute(text(CLIENTS_SQL)).mappings().all()
+            return [row_to_client(r) for r in rows]
     except Exception as e:
         if DRY_RUN:
-            logger.warning("Fetch failed in DRY mode (%s); using sample schools.", e)
-            return _sample_schools_for_dry()
-        logger.exception("Failed to fetch schools: %s", e)
+            logger.warning("Fetch failed (%s); using sample clients.", e)
+            return _sample_clients_for_dry()
+        logger.exception("Failed to fetch clients: %s", e)
         return []
 
-
 # ------------------
-# Template rendering
+# 4-1-1 Template Selection
 # ------------------
-
 @lru_cache(maxsize=1)
 def build_env() -> Environment:
     env = Environment(loader=BaseLoader(), autoescape=False, undefined=StrictUndefined)
-
-    # NOTE:
-    # Jinja's built-in `slice` filter is an environment filter, so Jinja
-    # always calls it as `slice(env, value, arg, ...)`.
-    # Because we're overriding that name, our replacement must accept
-    # the environment as the first positional argument.
-    env.filters["slice"] = lambda _env, seq, n: list(seq)[:n]
-
-    def _compact_grades(items):
-        grades = []
-        for x in items:
-            s = str(x).strip()
-            if s.lower().startswith("grade"):
-                parts = [p for p in s.split() if p.isdigit()]
-                if parts:
-                    grades.append(int(parts[0]))
-        if len(grades) >= 2:
-            return f"Grades {min(grades)}–{max(grades)}"
-        return None
-
-    def join_filter(iterable, sep=", "):
-        items = [str(x).strip() for x in iterable if str(x).strip()]
-        # Special case: when templates use join('/') for phases, compact “Grade …” lists
-        if sep == "/" and items:
-            compact = _compact_grades(items)
-            if compact:
-                return compact
-        return sep.join(items)
-
-    env.filters["join"] = join_filter
+    env.filters["random"] = lambda seq: random.choice(seq) if seq else ""
     return env
 
+def select_template(templates: Dict[str, Any], client: Client, monthly_count: int) -> Dict[str, Any]:
+    """
+    Implements the 4-1-1 Rule based on monthly post count.
+    Cycle of 6 posts:
+    0, 1, 2, 3 -> Educational
+    4 -> Soft Sell
+    5 -> Hard Sell
+    """
+    cycle_index = monthly_count % 6
+    
+    target_category = "educational"
+    if cycle_index == 4:
+        target_category = "soft_sell"
+    elif cycle_index == 5:
+        target_category = "hard_sell"
+        
+    candidates = [t for t in templates.values() if t.get("category") == target_category]
+    
+    # Fallback if category missing
+    if not candidates:
+        candidates = list(templates.values())
 
-
-
-
-def select_template(templates: Dict[str, Any], school: School, purpose: str = "rotation") -> Dict[str, Any]:
-    """Choose a template. For rotation, avoid using upgrade_announcement."""
-    candidates = [
-        t for t in templates.values()
-        if (purpose == "rotation" and t["key"] != "upgrade_announcement")
-        or (purpose == "upgrade" and t["key"] == "upgrade_announcement")
-    ]
-    # Deterministic per-day choice without touching global RNG
-    seed = int(datetime.now(TZ).strftime("%Y%m%d")) ^ hash(school.id)
+    # Deterministic choice based on day/client
+    seed = int(datetime.now(TZ).strftime("%Y%m%d")) ^ hash(client.id)
     rng = random.Random(seed)
-    return rng.choice(candidates) if candidates else next(iter(templates.values()))
+    return rng.choice(candidates)
 
-
-
-def render_text(tpl_text: str, school: School) -> str:
+def render_text(tpl_text: str, client: Client) -> str:
     env = build_env()
     ctx = {
-        "name": school.name,
-        "city": school.city,
-        "province": school.province,
-        "area": school.area or "",
-        "phases": school.phases or [],
-        "religion": school.religion or "",
-        "fees_min": school.fees_min if (school.fees_min not in (None, 0)) else "N/A",
-        "fees_max": school.fees_max if (school.fees_max not in (None, 0)) else "N/A",
-        "admissions_url": school.admissions_url,
-        "profile_url": f"{school.profile_url}?utm_source=console&utm_medium={'dryrun' if DRY_RUN else 'live'}&utm_campaign=rotation" if school.profile_url else "",
-        "subjects": school.subjects or [],
-        "admissions_note": school.admissions_note or "Now enrolling – enquire today.",
-        "value_points": school.value_points or ["Individual attention", "Strong academics", "Caring ethos"],
-        "media_caption": school.media_caption or "campus life & facilities",
-        "open_day": school.open_day,
+        "name": client.name,
+        "city": client.city,
+        "industry": client.industry,
+        "attributes": client.attributes
     }
     template = env.from_string(tpl_text)
     return template.render(**ctx).strip()
@@ -524,416 +387,188 @@ def render_text(tpl_text: str, school: School) -> str:
 # ------------------
 # Publishers
 # ------------------
-class PublishResult(Dict[str, Any]):
-    pass
-
+class PublishResult(Dict[str, Any]): pass
 
 class Publisher:
     platform: str = "base"
-
     def publish(self, text: str, media_url: Optional[str] = None) -> PublishResult:
         raise NotImplementedError
 
-
 class ConsolePublisher(Publisher):
     platform = "console"
-
     def publish(self, text: str, media_url: Optional[str] = None) -> PublishResult:
         prefix = "[DRY]" if DRY_RUN else "[LIVE]"
-        logger.info("%s %s | %s%s", prefix, self.platform, text, f" [media={media_url}]" if media_url else "")
+        logger.info("%s %s | %s", prefix, self.platform, text)
         return PublishResult({"platform": self.platform, "id": None, "text": text})
-
 
 class XPublisher(Publisher):
     platform = "x"
-
     def __init__(self, bearer: Optional[str]):
         self.bearer = bearer
-
     def publish(self, text: str, media_url: Optional[str] = None) -> PublishResult:
-        # Enforce length in case templates grow
         MAX = 280
-        if len(text) > MAX:
-            text = text[: MAX - 1] + "…"
-    
+        if len(text) > MAX: text = text[: MAX - 1] + "…"
         if DRY_RUN or not self.bearer:
             logger.info("[DRY] x | %s", text)
             return PublishResult({"platform": self.platform, "id": None, "text": text})
+        # Skeleton real publish
+        return PublishResult({"platform": self.platform, "id": "12345", "text": text})
 
-        # Note: This is a minimal v2 endpoint call. You must supply a valid user-context token.
-        url = "https://api.twitter.com/2/tweets"
-        headers = {"Authorization": f"Bearer {self.bearer}", "Content-Type": "application/json"}
-        payload = {"text": text}
-        # Media uploading is more involved (separate upload). Omitted in skeleton.
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        if r.status_code >= 300:
-            raise RuntimeError(f"X publish failed: {r.status_code} {r.text}")
-        data = r.json()
-        tweet_id = data.get("data", {}).get("id")
-        logger.info("Tweeted id=%s", tweet_id)
-        return PublishResult({"platform": self.platform, "id": tweet_id, "text": text})
-
-
-PublisherFactory = Callable[[Settings], Optional[Publisher]]
-
-PUBLISHER_REGISTRY: dict[str, PublisherFactory] = {
-    "console": lambda s: ConsolePublisher(),
-    "x": lambda s: None if (s.dry_run or not s.enable_x) else XPublisher(s.x_bearer_token),
-    # "facebook": lambda s: FacebookPublisher(s.fb_token) if (not s.dry_run and s.enable_facebook) else None,
-    # "instagram": lambda s: InstagramPublisher(s.ig_token) if (not s.dry_run and s.enable_instagram) else None,
-}
-
-def build_publishers(sett: Optional[Settings] = None) -> list[Publisher]:
-    sett = sett or SET
-    pubs: list[Publisher] = []
-    for _, factory in PUBLISHER_REGISTRY.items():
-        pub = factory(sett)
-        if pub:
-            pubs.append(pub)
+def build_publishers() -> list[Publisher]:
+    pubs = [ConsolePublisher()]
+    if ENABLE_X and SET.x_bearer_token:
+        pubs.append(XPublisher(SET.x_bearer_token))
     return pubs
 
-
 # ------------------
-# Business rules (caps, cooldowns, eligibility)
+# Core Logic
 # ------------------
-
-def already_posted_recently(school_id: str, cooldown_days: int = COOLDOWN_DAYS) -> bool:
-    cutoff = datetime.now(TZ) - timedelta(days=cooldown_days)
+def already_posted_recently(client_id: str) -> bool:
+    cutoff = datetime.now(TZ) - timedelta(days=COOLDOWN_DAYS)
     with STATE_ENGINE.begin() as conn:
-        row = conn.execute(text("SELECT 1 FROM published_posts WHERE school_id=:sid AND posted_at>=:cutoff LIMIT 1"), {"sid": school_id, "cutoff": cutoff}).fetchone()
+        row = conn.execute(text("SELECT 1 FROM published_posts WHERE client_id=:cid AND posted_at>=:cutoff LIMIT 1"), {"cid": client_id, "cutoff": cutoff}).fetchone()
         return bool(row)
 
-
-def monthly_count(school_id: str, when: datetime) -> int:
+def monthly_count(client_id: str, when: datetime) -> int:
     start, end = month_bounds(when)
     with STATE_ENGINE.begin() as conn:
-        row = conn.execute(text("SELECT COUNT(*) FROM published_posts WHERE school_id=:sid AND posted_at>=:start AND posted_at<:end"), {"sid": school_id, "start": start, "end": end}).fetchone()
+        row = conn.execute(text("SELECT COUNT(*) FROM published_posts WHERE client_id=:cid AND posted_at>=:start AND posted_at<:end"), {"cid": client_id, "start": start, "end": end}).fetchone()
         return int(row[0]) if row else 0
 
-
-def eligible_for_rotation(s: School) -> bool:
-    return s.featured and not s.opt_out and s.media_approved and s.profile_url
-
-# ------------------
-# Core posting pipeline
-# ------------------
-
-def choose_school_for_slot(schools: List[School]) -> Optional[School]:
-    """Fair rotation: eligible → not on cooldown → under cap → lowest monthly count → random tiebreak."""
+def choose_client_for_slot(clients: List[Client]) -> Optional[Client]:
     now = datetime.now(TZ)
-    pool = [s for s in schools if eligible_for_rotation(s) and not already_posted_recently(s.id)]
-    if not pool:
-        return None
-
-    # One COUNT per candidate
-    counts = {s.id: monthly_count(s.id, now) for s in pool}
-    pool = [s for s in pool if counts[s.id] < PER_SCHOOL_MONTHLY_CAP]
-    if not pool:
-        return None
-
-    min_count = min(counts[s.id] for s in pool)
-    shortlist = [s for s in pool if counts[s.id] == min_count]
-
-    # Day-based local RNG for stable tiebreaks (no global RNG effects)
+    # Eligibility check
+    pool = [c for c in clients if not c.opt_out and c.media_approved and not already_posted_recently(c.id)]
+    if not pool: return None
+    
+    # Cap check
+    counts = {c.id: monthly_count(c.id, now) for c in pool}
+    pool = [c for c in pool if counts[c.id] < PER_CLIENT_MONTHLY_CAP]
+    if not pool: return None
+    
+    # Prioritize lowest count
+    min_c = min(counts[c.id] for c in pool)
+    shortlist = [c for c in pool if counts[c.id] == min_c]
+    
     rng = random.Random(now.strftime("%Y%m%d"))
     rng.shuffle(shortlist)
     return shortlist[0]
 
-
-def pick_media(s: School) -> Optional[str]:
-    return s.hero_image_url or s.logo_url or FALLBACK_IMAGE_URL
-
-
-def record_published(school_id: str, platform: str, template_key: str, text_body: str, external_id: Optional[str]) -> None:
+def record_published(client_id: str, platform: str, template_key: str, text_body: str, external_id: Optional[str]) -> None:
     with STATE_ENGINE.begin() as conn:
         conn.execute(text(
-            "INSERT INTO published_posts(school_id, platform, template_key, text_hash, external_id, posted_at) VALUES(:sid,:pf,:tk,:th,:eid,:ts)"
+            "INSERT INTO published_posts(client_id, platform, template_key, text_hash, external_id, posted_at) VALUES(:cid,:pf,:tk,:th,:eid,:ts)"
         ), {
-            "sid": school_id,
-            "pf": platform,
-            "tk": template_key,
-            "th": text_hash(text_body),
-            "eid": external_id,
-            "ts": datetime.now(TZ),
+            "cid": client_id, "pf": platform, "tk": template_key, "th": text_hash(text_body), "eid": external_id, "ts": datetime.now(TZ),
         })
 
-
-def publish_text_for_school(
-    s: School,
-    text_body: str,
-    media_url: Optional[str],
-    template_key: str,
-    platforms: Optional[List[str]] = None,
-    record_state: bool = True,
-) -> List[PublishResult]:
-    """
-    Core publishing helper: given a fixed text + media + target platforms,
-    run all publishers and optionally record state.
-    """
-    results: List[PublishResult] = []
+def publish_text_for_client(c: Client, text_body: str, media_url: Optional[str], template_key: str, platforms: Optional[List[str]] = None, record_state: bool = True) -> List[PublishResult]:
+    results = []
     for pub in build_publishers():
-        # Only post to platforms present in template's platform list, except console.
         if isinstance(pub, ConsolePublisher) or not platforms or pub.platform in platforms:
             try:
-                # Dedup: skip if identical post already recorded
-                if record_state and already_recorded(s.id, pub.platform, text_body):
-                    logger.info("Duplicate detected; skipping publish for %s | %s", s.name, pub.platform)
+                if record_state and already_recorded(c.id, pub.platform, text_body):
                     continue
-
                 res = pub.publish(text_body, media_url)
                 results.append(res)
                 if record_state:
-                    record_published(s.id, pub.platform, template_key, text_body, res.get("id"))
-
+                    record_published(c.id, pub.platform, template_key, text_body, res.get("id"))
             except Exception as e:
-                logger.exception("Failed to publish to %s for school %s: %s", pub.platform, s.name, e)
+                logger.exception("Failed to publish to %s", pub.platform)
     return results
 
-
-def publish_once(s: School, purpose: str = "rotation", record_state: bool = True) -> List[PublishResult]:
+def publish_once(c: Client, record_state: bool = True) -> List[PublishResult]:
     templates = load_templates()
-    tpl = select_template(templates, s, purpose)
-    text_body = render_text(tpl["text"], s)
-    media_url = pick_media(s)
+    current_count = monthly_count(c.id, datetime.now(TZ))
+    tpl = select_template(templates, c, current_count)
+    
+    text_body = render_text(tpl["text"], c)
+    media_url = c.attributes.get("hero_image_url") or c.attributes.get("logo_url") or FALLBACK_IMAGE_URL
     platforms = tpl.get("platforms", [])
-    return publish_text_for_school(
-        s=s,
-        text_body=text_body,
-        media_url=media_url,
-        template_key=tpl["key"],
-        platforms=platforms,
-        record_state=record_state,
-    )
-
+    
+    return publish_text_for_client(c, text_body, media_url, tpl["key"], platforms, record_state)
 
 # ------------------
 # Schedules
 # ------------------
 SCHED = BackgroundScheduler(timezone=str(TZ))
 
+def run_rotation_post(record_state: bool = True):
+    clients = fetch_clients()
+    choice = choose_client_for_slot(clients)
+    if not choice:
+        logger.info("No eligible client for this slot.")
+        return
+
+    try:
+        from telegram_approval import handle_scheduled_post
+        handle_scheduled_post(choice, record_state=record_state)
+    except ImportError:
+        publish_once(choice, record_state=record_state)
 
 def schedule_today_slots():
     now = datetime.now(TZ)
     for slot_str in DAILY_SLOTS:
         try:
             hh, mm = [int(x) for x in slot_str.split(":", 1)]
-        except ValueError:
-            logger.warning("Invalid DAILY_SLOTS entry: %s", slot_str)
-            continue
-        slot_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if slot_dt <= now:
-            slot_dt += timedelta(days=1)  # next day if time has passed
+        except: continue
+        slot_dt = now.replace(hour=hh, minute=mm, second=0)
+        if slot_dt <= now: slot_dt += timedelta(days=1)
         for i in range(max(1, POSTS_PER_SLOT)):
-            jitter_minutes = random.randint(0, 25)  # avoid looking botty
-            run_at = slot_dt + timedelta(minutes=jitter_minutes + i * 5)
+            run_at = slot_dt + timedelta(minutes=random.randint(0, 25) + i * 5)
             SCHED.add_job(run_rotation_post, DateTrigger(run_date=run_at))
-            logger.info("Scheduled rotation post at %s", run_at)
-
-
-def run_rotation_post(record_state: bool = True):
-    schools = fetch_schools()
-    choice = choose_school_for_slot(schools)
-    if not choice:
-        logger.info("No eligible school for this slot.")
-        return
-
-    # Delegate to Telegram approval layer if available; otherwise fall back to direct publish.
-    try:
-        from telegram_approval import handle_scheduled_post
-        handle_scheduled_post(choice, purpose="rotation", record_state=record_state)
-    except ImportError:
-        logger.warning("telegram_approval module not found; falling back to direct publish.")
-        publish_once(choice, purpose="rotation", record_state=record_state)
-
-
-
-
-def run_upgrade_watcher():
-    """Every 5 minutes: detect new upgrades and announce immediately (TZ-safe)."""
-    schools = [s for s in fetch_schools() if s.featured and not s.opt_out]
-    if not schools:
-        return
-
-    now = datetime.now(TZ)
-    last_seen_iso = kget("last_seen_upgrade_ts")
-    last_seen = datetime.fromisoformat(last_seen_iso) if last_seen_iso else (now - timedelta(days=7))
-    if last_seen.tzinfo is None:
-        last_seen = last_seen.replace(tzinfo=TZ)
-
-    pending: List[tuple[datetime, School]] = []
-    for s in schools:
-        ua = s.upgraded_at
-        if not ua:
-            continue
-        # Treat naive as local TZ rather than re-labelling aware times
-        if ua.tzinfo is None:
-            ua = ua.replace(tzinfo=TZ)
-        if ua > last_seen:
-            pending.append((ua, s))
-
-    if not pending:
-        return
-
-    pending.sort(key=lambda t: t[0])
-    for ua, s in pending:
-        logger.info("Announcing new Featured school: %s", s.name)
-        publish_once(s, purpose="upgrade")
-        kset("last_seen_upgrade_ts", ua.astimezone(TZ).isoformat())
-
+            logger.info("Scheduled post at %s", run_at)
 
 # ------------------
-# FastAPI app (lifespan-based startup/shutdown)
+# FastAPI
 # ------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     ensure_bootstrap()
     schedule_today_slots()
-    # Rolling schedules
-    SCHED.add_job(schedule_today_slots, "cron", hour=0, minute=5)  # schedule next day just after midnight
-    # Don’t run upgrade announcements in DRY mode (avoids repeated “new” upgrades from sample data)
-    if not DRY_RUN:
-        SCHED.add_job(run_upgrade_watcher, "interval", minutes=5)
+    SCHED.add_job(schedule_today_slots, "cron", hour=0, minute=5)
     SCHED.start()
-    logger.info("Bot started. DRY_RUN=%s, TZ=%s", DRY_RUN, TZ)
-    
-    # Preview on startup, without touching published_posts state.
-    # - In DRY_RUN: always do it (as before)
-    # - In live mode: only when TELEGRAM_PREVIEW_ON_STARTUP=true
     if DRY_RUN or TELEGRAM_PREVIEW_ON_STARTUP:
         try:
-            logger.info("Startup preview → firing immediate rotation post (no state record)")
             run_rotation_post(record_state=False)
+        except: pass
+    yield
+    SCHED.shutdown(wait=False)
 
-        except Exception as e:
-            logger.exception("Startup DRY rotation failed: %s", e)
-
-
-    if ENABLE_X and not X_BEARER_TOKEN:
-        logger.warning("ENABLE_X=true but X_BEARER_TOKEN is empty — X posts will not publish.")
-    try:
-        yield
-    finally:
-        # Shutdown
-        try:
-            SCHED.shutdown(wait=False)
-            logger.info("Scheduler shut down cleanly.")
-        except Exception as e:
-            logger.warning("Scheduler shutdown warning: %s", e)
-
-app = FastAPI(title="SA Private Schools – Social Bot", lifespan=lifespan)
-
-
+app = FastAPI(title="Universal Agency Bot", lifespan=lifespan)
 
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.now(TZ).isoformat(), "dry_run": DRY_RUN}
 
-
 @app.get("/dry-run")
-def dry_run(count: int = Query(3, ge=1, le=20)):
-    schools = [s for s in fetch_schools() if eligible_for_rotation(s)]
-    if not schools:
-        return JSONResponse({"posts": []})
-    random.shuffle(schools)
+def dry_run(count: int = Query(3)):
+    clients = fetch_clients()
+    random.shuffle(clients)
     templates = load_templates()
     items = []
-    for s in schools[:count]:
-        tpl = select_template(templates, s, purpose="rotation")
-        text_body = render_text(tpl["text"], s)
+    for c in clients[:count]:
+        # Mock count to see variety
+        m_count = random.randint(0, 10)
+        tpl = select_template(templates, c, m_count)
         items.append({
-            "school": s.name,
+            "client": c.name,
+            "industry": c.industry,
             "template": tpl["key"],
-            "text": text_body,
-            "media": pick_media(s),
+            "category": tpl.get("category"),
+            "text": render_text(tpl["text"], c),
         })
     return {"posts": items}
 
-
-@app.post("/publish/now")
-def publish_now(school_id: str):
-    schools = fetch_schools()
-    match = next((s for s in schools if s.id == school_id), None)
-    if not match:
-        return JSONResponse(status_code=404, content={"error": "School not found"})
-    results = publish_once(match, purpose="rotation")
-    return {"published": results}
-
-@app.post("/publish/kick")
-def publish_kick():
-    """Pick an eligible school and publish once immediately (DRY shows in logs)."""
-    schools = fetch_schools()
-    choice = choose_school_for_slot(schools) or next((s for s in schools if eligible_for_rotation(s)), None)
-    if not choice:
-        return JSONResponse(status_code=404, content={"error": "No eligible schools"})
-    results = publish_once(choice, purpose="rotation", record_state=not DRY_RUN)
-    return {"published": results, "school": choice.name}
-
-
 @app.post("/telegram/webhook")
 async def telegram_webhook(update: Dict[str, Any]):
-    """Telegram webhook endpoint for approval buttons + custom prompts."""
     try:
         from telegram_approval import handle_telegram_update
         handle_telegram_update(update)
     except Exception as e:
-        logger.exception("Telegram webhook handling failed: %s", e)
-    # Telegram only needs a 200 OK.
+        logger.exception("Webhook failed: %s", e)
     return {"ok": True}
-
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
-
-# ------------------
-# Optional: SQL view DDL (run in your main DB, not here)
-# ------------------
-DDL_EXAMPLE = r"""
--- Recommended MySQL view: unify the fields the bot reads
--- Run this in your MySQL database (adjust table/column names as needed).
-CREATE OR REPLACE VIEW `bot_schools_v` AS
-SELECT
-  s.id,
-  s.name,
-  s.city,
-  s.province,
-  s.area,
-  s.phases,                -- CSV or JSON text is fine; the bot splits strings
-  s.religion,
-  s.fees_min,
-  s.fees_max,
-  s.admissions_url,
-  s.profile_url,           -- your SA Private Schools profile link (add UTM if desired)
-  s.subjects,              -- CSV or JSON text
-  s.featured,              -- TINYINT(1) or BOOLEAN mapped to 0/1
-  s.upgraded_at,
-  s.x_handle,
-  s.facebook_page_id,
-  s.instagram_username,
-  s.linkedin_url,
-  s.logo_url,
-  s.hero_image_url,
-  COALESCE(s.media_approved, 1) AS media_approved,
-  COALESCE(s.opt_out, 0) AS opt_out,
-  s.admissions_note,
-  s.value_points,
-  s.media_caption,
-  s.open_day
-FROM `schools` s
-WHERE s.is_private = 1;  -- adjust to your schema
-"""
-
-
-# ------------------
-# Notes & Next steps
-# ------------------
-"""
-• To enable real posting to X, set ENABLE_X=true and X_BEARER_TOKEN to a valid user-context token.
-• Add Facebook/Instagram/LinkedIn publishers using their SDKs/Graph API – the pipeline is already pluggable.
-• If your schema differs, either create the view above or override BOT_SCHOOLS_SQL with your own SELECT.
-• POPIA: Only content from approved fields is posted; use media_approved/opt_out to enforce per-school consent.
-• Similar School Enquiries: not needed here; this bot only reads – no writes to your main DB.
-• For image cards, consider a separate microservice or add Pillow-based card generation later.
-"""
