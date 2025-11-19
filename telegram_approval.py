@@ -418,7 +418,7 @@ def _handle_text_message(message: Dict[str, Any]) -> None:
         _set_state(state)
         return
 
-    new_bits = _generate_ai_post(s, state, custom_prompt=text)
+    new_bits = _generate_ai_post(s, state, custom_prompt=text) 
     state["text_body"] = new_bits["text_body"]
     state["media_url"] = new_bits["media_url"]
     state["template_key"] = new_bits["template_key"]
