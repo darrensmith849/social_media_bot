@@ -62,7 +62,23 @@ logger = logging.getLogger("agency-bot")
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Africa/Johannesburg"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+_raw_db_url = (os.getenv("DATABASE_URL") or "").strip()
+
+if _raw_db_url:
+    try:
+        # Parse URL and aggressively clean the database name
+        url_obj = make_url(_raw_db_url)
+        db_name = (url_obj.database or "").replace("\n", "").replace("\r", "").strip()
+        url_obj = url_obj.set(database=db_name)
+        DATABASE_URL = str(url_obj)
+        logger.info("Using DATABASE_URL=%r (database=%r)", DATABASE_URL, db_name)
+    except Exception as e:
+        logger.error("Failed to parse DATABASE_URL %r: %s", _raw_db_url, e)
+        DATABASE_URL = _raw_db_url
+else:
+    DATABASE_URL = None
+    logger.warning("DATABASE_URL is not set; using sample clients only (if DRY_RUN).")
+
 STATE_DB_URL = os.getenv("BOT_STATE_DB_URL", "sqlite:////data/bot.db")
 CLIENTS_SQL = os.getenv("BOT_CLIENTS_SQL", "SELECT * FROM bot_clients_v;")
 
@@ -122,10 +138,19 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 """
 
+def kget(k: str) -> Optional[str]:
+    with STATE_ENGINE.begin() as conn:
+        row = conn.execute(text("SELECT v FROM kv WHERE k=:k"), {"k": k}).fetchone()
+        return row[0] if row else None
+
+def kset(k: str, v: str) -> None:
+    with STATE_ENGINE.begin() as conn:
+        # SQLite-compatible UPSERT
+        conn.execute(text("INSERT OR REPLACE INTO kv (k, v) VALUES (:k, :v)"), {"k": k, "v": v})
+
 # ------------------
 # Templates (The 4-1-1 Implementation)
-# ------------------
-def _templates_path_from_state(url: str) -> str:
+# ------------------def _templates_path_from_state(url: str) -> str:
     try:
         if url.startswith("sqlite:"):
             u = make_url(url)
@@ -230,6 +255,37 @@ def load_templates() -> Dict[str, Any]:
         tpl_map[item["key"]] = item
     return tpl_map
 
+
+# ------------------
+# State KV helpers (used by Telegram approval)
+# ------------------
+def kget(key: str) -> Optional[str]:
+    """
+    Get a value from the KV store in the state DB.
+    Returns the stored string or None if the key does not exist.
+    """
+    with STATE_ENGINE.begin() as conn:
+        row = conn.execute(text("SELECT v FROM kv WHERE k = :k"), {"k": key}).first()
+        return row[0] if row else None
+
+
+def kset(key: str, value: Optional[str]) -> None:
+    """
+    Set a value in the KV store in the state DB.
+    If value is None, the key is deleted.
+    """
+    with STATE_ENGINE.begin() as conn:
+        if value is None:
+            conn.execute(text("DELETE FROM kv WHERE k = :k"), {"k": key})
+        else:
+            # portable "upsert": delete then insert
+            conn.execute(text("DELETE FROM kv WHERE k = :k"), {"k": key})
+            conn.execute(
+                text("INSERT INTO kv (k, v) VALUES (:k, :v)"),
+                {"k": key, "v": value},
+            )
+
+
 def month_bounds(dt: datetime) -> Tuple[datetime, datetime]:
     start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     if start.month == 12:
@@ -245,10 +301,46 @@ def already_recorded(client_id: str, platform: str, text_body: str) -> bool:
     th = text_hash(text_body)
     with STATE_ENGINE.begin() as conn:
         row = conn.execute(
-            text("SELECT 1 FROM published_posts WHERE client_id=:cid AND platform=:pf AND text_hash=:th LIMIT 1"),
+            text(
+                "SELECT 1 FROM published_posts "
+                "WHERE client_id=:cid AND platform=:pf AND text_hash=:th LIMIT 1"
+            ),
             {"cid": client_id, "pf": platform, "th": th},
         ).fetchone()
     return bool(row)
+
+
+def kget(key: str) -> Optional[str]:
+    """
+    Simple key-value getter backed by the `kv` table in the state DB.
+    Used by telegram_approval to store approval / draft state.
+    """
+    with STATE_ENGINE.begin() as conn:
+        row = conn.execute(
+            text("SELECT v FROM kv WHERE k = :k LIMIT 1"),
+            {"k": key},
+        ).fetchone()
+    return row[0] if row else None
+
+
+def kset(key: str, value: Optional[str]) -> None:
+    """
+    Simple key-value setter backed by the `kv` table.
+    - If value is None or empty, the key is removed.
+    - Otherwise we upsert via delete+insert (portable across DBs).
+    """
+    with STATE_ENGINE.begin() as conn:
+        # Remove any existing value first
+        conn.execute(
+            text("DELETE FROM kv WHERE k = :k"),
+            {"k": key},
+        )
+        if value:
+            conn.execute(
+                text("INSERT INTO kv (k, v) VALUES (:k, :v)"),
+                {"k": key, "v": value},
+            )
+
 
 # ------------------
 # DB ingest
