@@ -4,6 +4,8 @@ import json
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 import requests
+from sqlalchemy import text  # NEW: for direct KV access
+
 try:
     from openai import OpenAI
 except ImportError:
@@ -14,9 +16,50 @@ import main
 logger = main.logger
 TZ = main.TZ
 Client = main.Client
-kget = main.kget
-kset = main.kset
+
+# Prefer kget/kset from main; fall back to in-memory KV so imports never break.
+if hasattr(main, "kget") and hasattr(main, "kset"):
+    kget = main.kget
+    kset = main.kset
+else:
+    _mem_kv: Dict[str, str] = {}
+
+    def kget(key: str) -> Optional[str]:
+        return _mem_kv.get(key)
+
+    def kset(key: str, value: Optional[str]) -> None:
+        if value:
+            _mem_kv[key] = value
+        else:
+            _mem_kv.pop(key, None)
+
 publish_text_for_client = main.publish_text_for_client
+
+def kget(key: str) -> Optional[str]:
+    """
+    Read a value from the KV table in the shared state DB.
+    Returns None if the state DB is not available or key missing.
+    """
+    if STATE_ENGINE is None:
+        return None
+    with STATE_ENGINE.begin() as conn:
+        row = conn.execute(text("SELECT v FROM kv WHERE k = :k"), {"k": key}).first()
+        return row[0] if row else None
+
+def kset(key: str, value: Optional[str]) -> None:
+    """
+    Write a value to the KV table.
+    If value is None, the key is deleted.
+    """
+    if STATE_ENGINE is None:
+        return
+    with STATE_ENGINE.begin() as conn:
+        conn.execute(text("DELETE FROM kv WHERE k = :k"), {"k": key})
+        if value is not None:
+            conn.execute(
+                text("INSERT INTO kv (k, v) VALUES (:k, :v)"),
+                {"k": key, "v": value},
+            )
 
 TELEGRAM_BOT_TOKEN = main.TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID = main.TELEGRAM_CHAT_ID
@@ -162,45 +205,145 @@ def _edit_message(state):
     })
 
 def handle_telegram_update(update: Dict[str, Any]):
+    # --- Inline button callbacks (Approve / Regenerate / Customise) ---
     if "callback_query" in update:
         cb = update["callback_query"]
         data = cb.get("data")
         state = _get_state()
-        
+
+        # Acknowledge the button press so Telegram stops the "loading" spinner
         _post_telegram("answerCallbackQuery", {"callback_query_id": cb["id"]})
-        
-        if not state or state.get("status") != "pending": return
+
+        # If we don't have a pending draft, ignore the callback
+        if not state or state.get("status") != "pending":
+            return
 
         c = _find_client(state["client_id"])
-        
-        if data == "approve":
-            main.publish_text_for_client(c, state["text_body"], state["media_url"], state["template_key"], state["platforms"], state["record_state"])
-            _post_telegram("editMessageText", {
-                "chat_id": state["chat_id"], "message_id": state["message_id"],
-                "text": f"✅ Published for *{c.name}*", "parse_mode": "Markdown"
-            })
+        if not c:
+            _post_telegram(
+                "sendMessage",
+                {
+                    "chat_id": state.get("chat_id", TELEGRAM_CHAT_ID),
+                    "text": "Client for this draft was not found anymore.",
+                },
+            )
             _clear_state()
-            
+            return
+
+        if data == "approve":
+            # Publish to the configured platforms
+            main.publish_text_for_client(
+                c,
+                state["text_body"],
+                state["media_url"],
+                state["template_key"],
+                state["platforms"],
+                state["record_state"],
+            )
+            _post_telegram(
+                "editMessageText",
+                {
+                    "chat_id": state["chat_id"],
+                    "message_id": state["message_id"],
+                    "text": f"✅ Published for *{c.name}*",
+                    "parse_mode": "Markdown",
+                },
+            )
+            _clear_state()
+
         elif data == "regen":
+            # Regenerate using AI, keep it in 'pending' state
             new_state = _generate_ai_post(c, state)
+            new_state["status"] = "pending"
             _set_state(new_state)
             _edit_message(new_state)
-            
+
         elif data == "custom":
+            # Next text message from you will be treated as custom instructions
             state["status"] = "awaiting_custom"
             _set_state(state)
-            _post_telegram("sendMessage", {"chat_id": state["chat_id"], "text": "Reply with your instructions:"})
+            _post_telegram(
+                "sendMessage",
+                {
+                    "chat_id": state["chat_id"],
+                    "text": "Send your custom instructions for this post.",
+                },
+            )
 
+    # --- Normal messages (commands, custom text, etc.) ---
     elif "message" in update:
         msg = update["message"]
-        text = msg.get("text")
+        chat_id = msg["chat"]["id"]
+        text = msg.get("text") or ""
         state = _get_state()
-        
+
+        # Normalise first token so we can recognise /next-post, /next_post, /next-post@BotName, etc.
+        command = ""
+        if text.startswith("/"):
+            command = text.split()[0].split("@")[0].lower()
+
+        # 1) /next-post command: start a small flow to ask for client ID
+        if command in ("/next-post", "/next_post"):
+            _set_state(
+                {
+                    "status": "awaiting_client_id",
+                    "chat_id": chat_id,
+                }
+            )
+            _post_telegram(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": "Please send the client ID for the next post (for example: six_sigma_south_7626).",
+                },
+            )
+            return
+
+        # 2) After /next-post, treat the next message as the client ID
+        if state and state.get("status") == "awaiting_client_id" and text:
+            client_id = text.strip()
+            c = _find_client(client_id)
+
+            if not c:
+                _post_telegram(
+                    "sendMessage",
+                    {
+                        "chat_id": chat_id,
+                        "text": f"Client ID '{client_id}' was not found. Please paste the exact ID from the database.",
+                    },
+                )
+                # Keep status as 'awaiting_client_id' so you can retry
+                return
+
+            # Reuse the existing scheduled-post logic, but for this specific client only.
+            # Because TELEGRAM_APPROVAL_ENABLED is true, this will send you a preview
+            # with Approve / Regenerate / Customise buttons instead of auto-posting.
+            handle_scheduled_post(c, record_state=True)
+            return
+
+        # 3) Custom instructions for the current draft
         if state and state.get("status") == "awaiting_custom" and text:
             c = _find_client(state["client_id"])
+            if not c:
+                _post_telegram(
+                    "sendMessage",
+                    {
+                        "chat_id": chat_id,
+                        "text": "Client for this draft was not found anymore.",
+                    },
+                )
+                _clear_state()
+                return
+
             new_state = _generate_ai_post(c, state, custom_prompt=text)
             new_state["status"] = "pending"
             _set_state(new_state)
             _edit_message(new_state)
             # Confirm receipt
-            _post_telegram("sendMessage", {"chat_id": msg["chat"]["id"], "text": "Updated draft 👆"})
+            _post_telegram(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": "Updated draft 👆",
+                },
+            )
