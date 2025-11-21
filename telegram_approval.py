@@ -62,7 +62,7 @@ def _approval_keyboard():
         {"text": "Approve ✅", "callback_data": "approve"},
         {"text": "Regenerate 🔁", "callback_data": "regen"},
         {"text": "Customise ✏️", "callback_data": "custom"},
-    ]]}
+    ]]} 
 
 def _generate_ai_post(c: Client, state: Dict[str, Any], custom_prompt: Optional[str] = None) -> Dict[str, Any]:
     """
