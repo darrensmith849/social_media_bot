@@ -529,7 +529,12 @@ def run_rotation_post(record_state: bool = True):
         from telegram_approval import handle_scheduled_post
         handle_scheduled_post(choice, record_state=record_state)
     except ImportError:
+        logger.info("telegram_approval not available, publishing directly.")
         publish_once(choice, record_state=record_state)
+    except Exception:
+        logger.exception("Scheduled post failed via Telegram approval, falling back to direct publish.")
+        publish_once(choice, record_state=record_state)
+
 
 def schedule_today_slots():
     now = datetime.now(TZ)
@@ -553,12 +558,26 @@ async def lifespan(app: FastAPI):
     schedule_today_slots()
     SCHED.add_job(schedule_today_slots, "cron", hour=0, minute=5)
     SCHED.start()
+
     if DRY_RUN or TELEGRAM_PREVIEW_ON_STARTUP:
+        logger.info(
+            "Running startup preview: DRY_RUN=%s, TELEGRAM_PREVIEW_ON_STARTUP=%s, TELEGRAM_APPROVAL_ENABLED=%s",
+            DRY_RUN,
+            TELEGRAM_PREVIEW_ON_STARTUP,
+            TELEGRAM_APPROVAL_ENABLED,
+        )
         try:
+            # record_state=False so this doesn't pollute monthly caps / cooldown logic
             run_rotation_post(record_state=False)
-        except: pass
-    yield
-    SCHED.shutdown(wait=False)
+        except Exception:
+            logger.exception("Startup preview failed")
+
+    try:
+        yield
+    finally:
+        SCHED.shutdown(wait=False)
+
+
 
 app = FastAPI(title="Universal Agency Bot", lifespan=lifespan)
 
