@@ -39,8 +39,9 @@ import yaml
 import requests
 from jinja2 import Environment, BaseLoader, StrictUndefined
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Body, HTTPException
 from fastapi.responses import JSONResponse
+
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
@@ -150,7 +151,7 @@ post_templates:
   - key: edu_tip
     category: educational
     platforms: [x, facebook, linkedin]
-    text: "💡 Tip from {{ name }}: {{ attributes.tips|random if attributes.tips else 'Did you know? Consistency is key to success.' }} #{{ industry|replace(' ','') }} #{{ city|replace(' ','') }}"
+    text: "💡 {{ attributes.content_theme or (attributes.tone ~ ' insight from ' ~ name) }}: {{ attributes.tips|random if attributes.tips else 'Did you know? Consistency is key to success.' }} #{{ industry|replace(' ','') }} #{{ city|replace(' ','') }}"
 
   - key: edu_mythbuster
     category: educational
@@ -165,7 +166,7 @@ post_templates:
   - key: edu_didyouknow
     category: educational
     platforms: [x, facebook, linkedin]
-    text: "Did you know? {{ attributes.facts|random if attributes.facts else 'We have been serving ' + city + ' for years.' }} 🌍"
+    text: "Did you know? {{ attributes.facts|random if attributes.facts else 'We have been serving ' + city + ' for years.' }} 🌍 {{ (attributes.content_pillars or [])|random if attributes.content_pillars else '' }}"
 
   # --- SOFT SELL (Index 4) ---
   - key: soft_team
@@ -423,28 +424,51 @@ def build_publishers() -> list[Publisher]:
 # ------------------
 # Core Logic
 # ------------------
-def already_posted_recently(client_id: str) -> bool:
-    cutoff = datetime.now(TZ) - timedelta(days=COOLDOWN_DAYS)
+def already_posted_recently(client_id: str, cooldown_days: int) -> bool:
+    cutoff = datetime.now(TZ) - timedelta(days=cooldown_days)
     with STATE_ENGINE.begin() as conn:
-        row = conn.execute(text("SELECT 1 FROM published_posts WHERE client_id=:cid AND posted_at>=:cutoff LIMIT 1"), {"cid": client_id, "cutoff": cutoff}).fetchone()
+        row = conn.execute(
+            text("SELECT 1 FROM published_posts WHERE client_id=:cid AND posted_at>=:cutoff LIMIT 1"),
+            {"cid": client_id, "cutoff": cutoff},
+        ).fetchone()
         return bool(row)
 
 def monthly_count(client_id: str, when: datetime) -> int:
     start, end = month_bounds(when)
     with STATE_ENGINE.begin() as conn:
-        row = conn.execute(text("SELECT COUNT(*) FROM published_posts WHERE client_id=:cid AND posted_at>=:start AND posted_at<:end"), {"cid": client_id, "start": start, "end": end}).fetchone()
+        row = conn.execute(
+            text("SELECT COUNT(*) FROM published_posts WHERE client_id=:cid AND posted_at>=:start AND posted_at<:end"),
+            {"cid": client_id, "start": start, "end": end},
+        ).fetchone()
         return int(row[0]) if row else 0
 
 def choose_client_for_slot(clients: List[Client]) -> Optional[Client]:
     now = datetime.now(TZ)
-    # Eligibility check
-    pool = [c for c in clients if not c.opt_out and c.media_approved and not already_posted_recently(c.id)]
-    if not pool: return None
+
+    # Eligibility check (per-client cooldown & opt-outs)
+    eligible: List[Client] = []
+    for c in clients:
+        if c.opt_out or not c.media_approved:
+            continue
+        cooldown_days = int(c.attributes.get("cooldown_days", COOLDOWN_DAYS))
+        if not already_posted_recently(c.id, cooldown_days):
+            eligible.append(c)
+
+    if not eligible:
+        logger.info("No eligible clients after cooldown/opt-out filtering.")
+        return None
     
-    # Cap check
-    counts = {c.id: monthly_count(c.id, now) for c in pool}
-    pool = [c for c in pool if counts[c.id] < PER_CLIENT_MONTHLY_CAP]
-    if not pool: return None
+    # Cap check (per-client monthly caps)
+    counts: Dict[str, int] = {c.id: monthly_count(c.id, now) for c in eligible}
+    caps: Dict[str, int] = {
+        c.id: int(c.attributes.get("max_posts_per_month", PER_CLIENT_MONTHLY_CAP))
+        for c in eligible
+    }
+
+    pool = [c for c in eligible if counts[c.id] < caps[c.id]]
+    if not pool:
+        logger.info("No eligible clients after monthly cap filtering.")
+        return None
     
     # Prioritize lowest count
     min_c = min(counts[c.id] for c in pool)
@@ -453,6 +477,7 @@ def choose_client_for_slot(clients: List[Client]) -> Optional[Client]:
     rng = random.Random(now.strftime("%Y%m%d"))
     rng.shuffle(shortlist)
     return shortlist[0]
+
 
 def record_published(client_id: str, platform: str, template_key: str, text_body: str, external_id: Optional[str]) -> None:
     with STATE_ENGINE.begin() as conn:
@@ -560,6 +585,49 @@ def dry_run(count: int = Query(3)):
         })
     return {"posts": items}
 
+
+@app.post("/clients/{client_id}/attributes/merge")
+def merge_client_attributes(client_id: str, overrides: Dict[str, Any] = Body(...)):
+    """
+    Merge manually-uploaded attributes into the client's attributes JSON.
+
+    - If a key exists in overrides, it overwrites the scraped value.
+    - If a key is omitted in overrides, the scraped value is preserved.
+
+    This is the backend hook for your 'upload section'.
+    """
+    try:
+        eng = get_main_engine()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    with eng.begin() as conn:
+        row = conn.execute(
+            text("SELECT attributes FROM clients WHERE id = :id"),
+            {"id": client_id},
+        ).first()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Client not found")
+
+        current_attrs = row[0] or {}
+        if isinstance(current_attrs, str):
+            try:
+                current_attrs = json.loads(current_attrs) or {}
+            except Exception:
+                current_attrs = {}
+
+        # Manual upload always wins on conflict
+        merged = {**current_attrs, **overrides}
+
+        conn.execute(
+            text("UPDATE clients SET attributes = :attr WHERE id = :id"),
+            {"id": client_id, "attr": json.dumps(merged)},
+        )
+
+    return {"ok": True, "client_id": client_id}
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(update: Dict[str, Any]):
     try:
@@ -568,6 +636,7 @@ async def telegram_webhook(update: Dict[str, Any]):
     except Exception as e:
         logger.exception("Webhook failed: %s", e)
     return {"ok": True}
+
 
 if __name__ == "__main__":
     import uvicorn
