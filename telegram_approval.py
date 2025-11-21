@@ -110,30 +110,43 @@ def _generate_ai_post(c: Client, state: Dict[str, Any], custom_prompt: Optional[
         logger.error("AI Gen failed: %s", e)
         return state
 
-def _send_preview_message(c: Client, text_body: str, media_url: Optional[str], template_key: str, platforms: List[str], record_state: bool):
-    if not TELEGRAM_CHAT_ID: return
-    
+def _send_preview_message(
+    c: Client,
+    text_body: str,
+    media_url: Optional[str],
+    template_key: str,
+    platforms: List[str],
+    record_state: bool,
+) -> None:
+    """Send the preview to Telegram and persist state for callbacks."""
+    if not TELEGRAM_CHAT_ID:
+        return
+
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": _build_preview_text(c, text_body),
         "reply_markup": _approval_keyboard(),
-        "parse_mode": "Markdown"
+        "parse_mode": "Markdown",
     }
     data = _post_telegram("sendMessage", payload)
-    if not data or not data.get("ok"): return
+    if not data or not data.get("ok"):
+        return
 
     msg = data["result"]
-    _set_state({
-        "status": "pending",
-        "client_id": c.id,
-        "text_body": text_body,
-        "media_url": media_url,
-        "template_key": template_key,
-        "platforms": platforms,
-        "record_state": record_state,
-        "chat_id": msg["chat"]["id"],
-        "message_id": msg["message_id"],
-    })
+    _set_state(
+        {
+            "status": "pending",
+            "client_id": c.id,
+            "text_body": text_body,
+            "media_url": media_url,
+            "template_key": template_key,
+            "platforms": platforms,
+            "record_state": record_state,
+            "chat_id": msg["chat"]["id"],
+            "message_id": msg["message_id"],
+        }
+    )
+
 
 def handle_scheduled_post(c: Client, record_state: bool = True):
     if not main.TELEGRAM_APPROVAL_ENABLED:
