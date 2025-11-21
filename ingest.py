@@ -1,36 +1,20 @@
 # ingest.py
 
 from dotenv import load_dotenv
-load_dotenv(override=True)
+load_dotenv()                   
 
 import os
 import uuid
 import json
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
-from firecrawl import Firecrawl
+from firecrawl import FirecrawlApp
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError 
 
 # --- CONFIGURATION ---
-from sqlalchemy.engine import make_url  # add this near the top with other imports
-
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
-
-_raw_db_url = (os.getenv("DATABASE_URL") or "").strip()
-if _raw_db_url:
-    try:
-        url_obj = make_url(_raw_db_url)
-        db_name = (url_obj.database or "").replace("\n", "").replace("\r", "").strip()
-        url_obj = url_obj.set(database=db_name)
-        DATABASE_URL = str(url_obj)
-        print(f"Using DATABASE_URL={DATABASE_URL!r} (database={db_name!r})")
-    except Exception as e:
-        print(f"WARNING: Failed to parse DATABASE_URL {_raw_db_url!r}: {e}")
-        DATABASE_URL = _raw_db_url
-else:
-    DATABASE_URL = None
-    print("WARNING: DATABASE_URL is not set in ingest.py")
+DATABASE_URL = os.getenv("DATABASE_URL") 
 
 # --- 1. DEFINE THE BRAND DNA SCHEMA ---
 # NOTE: List fields (tips, myths) are now Optional with default_factory=list.
@@ -53,66 +37,32 @@ def onboard_client(url: str):
         print("❌ Error: FIRECRAWL_API_KEY not found in .env file.")
         return
 
-    # Use the current Firecrawl SDK class
-    firecrawl = Firecrawl(api_key=FIRECRAWL_API_KEY)
-
+    app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
+    
+    # Using app.extract() with direct arguments (schema=, prompt=)
     try:
-        # Call Firecrawl Extract with your BrandDNA schema
-        res = firecrawl.extract(
+        data_list = app.extract(
             urls=[url],
-            prompt="Extract the brand identity, tone, constraints, and details from this website.",
             schema=BrandDNA.model_json_schema(),
+            prompt="Extract the brand identity, tone, constraints, and details from this website."
         )
+        
+        # Check if data was returned and is correctly structured
+        if not data_list or not isinstance(data_list, list) or not data_list[0].get("data"):
+            raise ValueError("Extraction returned empty or poorly structured data from API.")
 
-        # --- Normalise the response into a plain dict we can work with ---
-
-        # Many SDK versions return a response object with a .data attribute
-        payload = getattr(res, "data", None) or res
-
-        result: Dict[str, Any] = {}
-
-        # Case 1: payload is already the BrandDNA-ish dict
-        if isinstance(payload, dict):
-            # If it already looks like our schema (company_name etc.), just use it
-            if "company_name" in payload or "industry" in payload:
-                result = payload
-            # Case 2: { "success": true, "data": { ... } }
-            elif isinstance(payload.get("data"), dict):
-                result = payload["data"]
-            # Case 3: { "results": [ { "data": {...} } ] }
-            elif isinstance(payload.get("results"), list) and payload["results"]:
-                first = payload["results"][0]
-                if isinstance(first, dict):
-                    if isinstance(first.get("data"), dict):
-                        result = first["data"]
-                    else:
-                        result = first
-
-        # Case 4: some older shapes return a list
-        elif isinstance(payload, list) and payload:
-            first = payload[0]
-            if isinstance(first, dict):
-                if isinstance(first.get("data"), dict):
-                    result = first["data"]
-                else:
-                    result = first
-
-        # Final sanity check: if we still don't have something usable, stop gracefully
-        if not isinstance(result, dict) or not result:
-            print("❌ Extraction returned empty or poorly structured data from API.")
-            print("   Raw Firecrawl response (truncated):")
-            print(str(res)[:1000])
-            return
-
+        # The result is nested under 'data' in the response list
+        result: Dict[str, Any] = data_list[0].get("data") or {}
+        
     except Exception as e:
+        # Catching the previous errors (params, attribute) more generically
         print(f"❌ Extraction failed. Error: {e}")
         return
 
     # --- Verification and Save ---
+    
     if not result.get("company_name"):
         print("❌ AI failed to identify the company name (a mandatory field). Aborting save.")
-        print("   Full extracted payload (truncated):")
-        print(str(result)[:1000])
         return
 
     print("✅ Analysis Complete!")
@@ -121,7 +71,7 @@ def onboard_client(url: str):
     print(f"   Tone: {result.get('tone', 'N/A')}")
     print(f"   No-Go Zone: {result.get('negative_constraints', 'None specified')}")
 
-    # --- SAVE TO DATABASE ---
+    # --- 3. SAVE TO DATABASE ---
     save_to_db(result, url)
 
 def save_to_db(data: dict, url: str):
