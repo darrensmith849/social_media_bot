@@ -28,8 +28,57 @@ class BrandDNA(BaseModel):
     tips: Optional[List[str]] = Field(default_factory=list, description="5 generic, helpful tips related to their industry for social media content.")
     myths: Optional[List[str]] = Field(default_factory=list, description="3 common myths about their industry that they can debunk.")
     hard_sell_offer: Optional[str] = Field(description="A short call-to-action phrase found on the site (e.g., 'Book your free consultation').")
+    # NEW: high-level content theme & pillars + suggested cadence
+    content_theme: Optional[str] = Field(
+        description="A short phrase describing the core content theme (e.g., 'Empowering busy parents to stay fit')."
+    )
+    content_pillars: Optional[List[str]] = Field(
+        default_factory=list,
+        description="3–5 content pillars (e.g., 'Education', 'Testimonials', 'Behind the scenes', 'Offers')."
+    )
+    suggested_posts_per_week: Optional[int] = Field(
+        description="Suggested posting frequency per week based on brand size and activity."
+    )
+
 
 # --- 2. THE INGESTION FUNCTION ---
+
+def build_extraction_urls(root_url: str) -> List[str]:
+    """
+    Build a small, opinionated list of URLs to feed into Firecrawl.extract.
+
+    We start with the homepage and then add common high-signal pages
+    like /about, /services, /pricing, /contact, etc.
+    """
+    base = root_url.rstrip("/")
+
+    candidates = [
+        base,
+        f"{base}/about",
+        f"{base}/about-us",
+        f"{base}/who-we-are",
+        f"{base}/services",
+        f"{base}/our-services",
+        f"{base}/what-we-do",
+        f"{base}/team",
+        f"{base}/meet-the-team",
+        f"{base}/pricing",
+        f"{base}/plans",
+        f"{base}/contact",
+        f"{base}/contact-us",
+    ]
+
+    # De-duplicate while preserving order
+    seen = set()
+    urls: List[str] = []
+    for u in candidates:
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    return urls
+
+
 def onboard_client(url: str):
     print(f"🕵️  Analyzing {url}...")
     
@@ -37,15 +86,23 @@ def onboard_client(url: str):
         print("❌ Error: FIRECRAWL_API_KEY not found in .env file.")
         return
 
-    app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
-    
-    # Using app.extract() with direct arguments (schema=, prompt=)
+    # Use the current Firecrawl SDK class
+    firecrawl = Firecrawl(api_key=FIRECRAWL_API_KEY)
+
+    # Build a small set of high-signal URLs to extract from
+    urls_to_extract = build_extraction_urls(url)
+    print("🌐 Extracting from pages:")
+    for u in urls_to_extract:
+        print(f"   - {u}")
+
     try:
-        data_list = app.extract(
-            urls=[url],
+        # Call Firecrawl Extract with your BrandDNA schema over multiple pages
+        res = firecrawl.extract(
+            urls=urls_to_extract,
+            prompt="Extract the brand identity, tone, constraints, and details from this website.",
             schema=BrandDNA.model_json_schema(),
-            prompt="Extract the brand identity, tone, constraints, and details from this website."
         )
+
         
         # Check if data was returned and is correctly structured
         if not data_list or not isinstance(data_list, list) or not data_list[0].get("data"):
@@ -60,19 +117,27 @@ def onboard_client(url: str):
         return
 
     # --- Verification and Save ---
-    
     if not result.get("company_name"):
         print("❌ AI failed to identify the company name (a mandatory field). Aborting save.")
+        print("   Full extracted payload (truncated):")
+        print(str(result)[:1000])
         return
+
+    # Attach the pages we actually used for extraction so we can inspect later
+    result["source_pages"] = urls_to_extract
 
     print("✅ Analysis Complete!")
     print(f"   Name: {result['company_name']}")
     print(f"   Industry: {result.get('industry', 'N/A')}")
     print(f"   Tone: {result.get('tone', 'N/A')}")
     print(f"   No-Go Zone: {result.get('negative_constraints', 'None specified')}")
+    print("   Source pages used:")
+    for u in urls_to_extract:
+        print(f"   - {u}")
 
-    # --- 3. SAVE TO DATABASE ---
+    # --- SAVE TO DATABASE ---
     save_to_db(result, url)
+
 
 def save_to_db(data: dict, url: str):
     # Create a clean ID (e.g., "smile_dental_a1b2")
@@ -89,8 +154,16 @@ def save_to_db(data: dict, url: str):
         "myths": data.get('myths'),
         "hard_sell_offer": data.get('hard_sell_offer'), 
         "media_approved": True, 
-        "opt_out": False
+        "opt_out": False,
+        # Pages we actually fed into the extraction step
+        "source_pages": data.get("source_pages") or [],
+        # NEW: content theme & pillars suggested by AI (can be overridden later)
+        "content_theme": data.get("content_theme"),
+        "content_pillars": data.get("content_pillars") or [],
+        "suggested_posts_per_week": data.get("suggested_posts_per_week"),
     }
+
+
 
     if not DATABASE_URL:
         print("❌ ERROR: DATABASE_URL is not set. Cannot save to database.")
