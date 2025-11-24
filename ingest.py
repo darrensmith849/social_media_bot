@@ -17,28 +17,141 @@ FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL") 
 
 # --- 1. DEFINE THE BRAND DNA SCHEMA ---
-# NOTE: List fields (tips, myths) are now Optional with default_factory=list.
-# This prevents the extraction from failing if the AI can't find enough content.
+# NOTE: List fields (tips, myths) are Optional with default_factory=list
+# so extraction doesn't die if the AI can't find enough items.
+
+class ContentAtoms(BaseModel):
+    """Reusable content atoms we can recombine into posts."""
+
+    story_mission: Optional[str] = Field(
+        default=None,
+        description="1–2 sentence brand story or mission that can be reused in intros.",
+    )
+    services_benefits: Optional[List[str]] = Field(
+        default_factory=list,
+        description="Bullet-friendly list of services and their key benefits.",
+    )
+    faqs: Optional[List[str]] = Field(
+        default_factory=list,
+        description="Short FAQ-style lines we can turn into Q&A posts.",
+    )
+    stats: Optional[List[str]] = Field(
+        default_factory=list,
+        description="Proof points, numbers, or stats we can reuse across posts.",
+    )
+    offers: Optional[List[str]] = Field(
+        default_factory=list,
+        description="Current offers, promos, or hooks that work well for hard-sell posts.",
+    )
+
+
+class ProductSpotlight(BaseModel):
+    """Lightweight product representation for ecommerce content."""
+
+    name: str = Field(description="Name of the product.")
+    short_benefit: str = Field(
+        description="Short benefit-driven sentence highlighting why this product matters."
+    )
+    url: Optional[str] = Field(
+        default=None,
+        description="URL of the product page.",
+    )
+    image_url: Optional[str] = Field(
+        default=None,
+        description="URL of a representative product image.",
+    )
+    price_band: Optional[str] = Field(
+        default=None,
+        description="Optional price band label (e.g., 'budget', 'mid-range', 'premium').",
+    )
+    category: Optional[str] = Field(
+        default=None,
+        description="High-level category/collection this product belongs to.",
+    )
+
+
 class BrandDNA(BaseModel):
-    company_name: str = Field(description="The official name of the business")
-    industry: str = Field(description="A short 2-3 word industry category (e.g., 'Family Dentistry', 'Craft Brewery')")
-    city: str = Field(description="The primary city where they operate. Default to 'South Africa' if unclear.")
-    tone: str = Field(description="The brand voice adjectives (e.g., 'Professional & Trustworthy', 'Fun & Edgy')")
-    negative_constraints: str = Field(description="Topics or words this brand should strictly AVOID based on their vibe (e.g., 'Avoid slang', 'No medical advice').")
-    tips: Optional[List[str]] = Field(default_factory=list, description="5 generic, helpful tips related to their industry for social media content.")
-    myths: Optional[List[str]] = Field(default_factory=list, description="3 common myths about their industry that they can debunk.")
-    hard_sell_offer: Optional[str] = Field(description="A short call-to-action phrase found on the site (e.g., 'Book your free consultation').")
-    # NEW: high-level content theme & pillars + suggested cadence
+    company_name: str = Field(description="The official name of the business.")
+    industry: str = Field(
+        description="A short 2–3 word industry category (e.g., 'Family Dentistry', 'Craft Brewery')."
+    )
+    city: str = Field(
+        description="The primary city where they operate. Default to 'South Africa' if unclear."
+    )
+    tone: str = Field(
+        description="The brand voice adjectives (e.g., 'Professional & Trustworthy', 'Fun & Edgy')."
+    )
+
+    # Core constraints & reusable ideas
+    negative_constraints: str = Field(
+        description=(
+            "Topics or phrases this brand should strictly AVOID based on their vibe "
+            "(e.g., 'Avoid slang', 'No medical advice')."
+        )
+    )
+    tips: Optional[List[str]] = Field(
+        default_factory=list,
+        description="5 generic, helpful tips related to their industry for social media content.",
+    )
+    myths: Optional[List[str]] = Field(
+        default_factory=list,
+        description="3 common myths about their industry that they can debunk.",
+    )
+    hard_sell_offer: Optional[str] = Field(
+        default=None,
+        description=(
+            "A short, punchy hard-sell offer phrase found on the site "
+            "(e.g., 'Book your free consultation')."
+        ),
+    )
+
+    # High-level content theme & pillars + suggested cadence
     content_theme: Optional[str] = Field(
-        description="A short phrase describing the core content theme (e.g., 'Empowering busy parents to stay fit')."
+        default=None,
+        description=(
+            "A short phrase describing the core content theme "
+            "(e.g., 'Empowering busy parents to stay fit')."
+        ),
     )
     content_pillars: Optional[List[str]] = Field(
         default_factory=list,
-        description="3–5 content pillars (e.g., 'Education', 'Testimonials', 'Behind the scenes', 'Offers')."
+        description="3–5 content pillars (e.g., 'Education', 'Testimonials', 'Behind the scenes', 'Offers').",
     )
     suggested_posts_per_week: Optional[int] = Field(
-        description="Suggested posting frequency per week based on brand size and activity."
+        default=None,
+        description="Suggested posting frequency per week based on brand size and activity.",
     )
+
+    # Aggregated content atoms (from page-level content)
+    content_atoms: Optional[ContentAtoms] = Field(
+        default=None,
+        description=(
+            "Reusable content atoms (story, services, FAQs, stats, offers) aggregated "
+            "from the most important pages."
+        ),
+    )
+
+    # Ecommerce-specific signals
+    is_ecommerce: Optional[bool] = Field(
+        default=None,
+        description="True if this is primarily an online shop / ecommerce brand.",
+    )
+    ecommerce_platform: Optional[str] = Field(
+        default=None,
+        description="Detected ecommerce platform, e.g. 'Shopify', 'WooCommerce', 'Wix', 'Custom', etc.",
+    )
+    product_categories: Optional[List[str]] = Field(
+        default_factory=list,
+        description="High-level product categories / collections suitable for softer spotlight posts.",
+    )
+    product_spotlights: Optional[List[ProductSpotlight]] = Field(
+        default_factory=list,
+        description=(
+            "A small pool of spotlight products (name, benefit, URL, image, price band) "
+            "for hard-sell or promo content."
+        ),
+    )
+
 
 
 # --- 2. THE INGESTION FUNCTION ---
@@ -47,36 +160,57 @@ def build_extraction_urls(root_url: str) -> List[str]:
     """
     Build a small, opinionated list of URLs to feed into Firecrawl.extract.
 
-    We start with the homepage and then add common high-signal pages
-    like /about, /services, /pricing, /contact, etc.
+    Strategy:
+    - Always include the homepage.
+    - Include high-signal static pages: about, services, pricing, contact, team.
+    - Include common ecommerce slugs if present (shop, products, collections, store).
+    - Optionally include a wildcard URL so Firecrawl can explore navigation menus.
+    - De-duplicate and cap to a sensible number of pages (5–10).
     """
     base = root_url.rstrip("/")
 
     candidates = [
+        # Core
         base,
+        # Wildcard for Firecrawl to follow internal links (acts like "navigation aware" crawling)
+        f"{base}/*",
+        # Brand/credibility pages
         f"{base}/about",
         f"{base}/about-us",
         f"{base}/who-we-are",
+        # Services / benefits
         f"{base}/services",
         f"{base}/our-services",
         f"{base}/what-we-do",
+        # Team / trust
         f"{base}/team",
         f"{base}/meet-the-team",
+        # Pricing / offer clarity
         f"{base}/pricing",
         f"{base}/plans",
+        # Contact / conversion
         f"{base}/contact",
         f"{base}/contact-us",
+        # Ecommerce-oriented paths
+        f"{base}/shop",
+        f"{base}/store",
+        f"{base}/products",
+        f"{base}/collections",
+        f"{base}/catalog",
     ]
 
-    # De-duplicate while preserving order
-    seen = set()
+    # De-duplicate while preserving order and cap length
+    seen: set[str] = set()
     urls: List[str] = []
     for u in candidates:
         if u not in seen:
             seen.add(u)
             urls.append(u)
+        if len(urls) >= 10:
+            break
 
     return urls
+
 
 
 def onboard_client(url: str):
@@ -96,25 +230,45 @@ def onboard_client(url: str):
         print(f"   - {u}")
 
     try:
-        # Call Firecrawl Extract with your BrandDNA schema over multiple pages
+        # Call Firecrawl Extract with your BrandDNA schema over multiple pages.
+        # The current SDK expects: extract(urls: List[str], options: Dict[str, Any])
         res = firecrawl.extract(
-            urls=urls_to_extract,
-            prompt="Extract the brand identity, tone, constraints, and details from this website.",
-            schema=BrandDNA.model_json_schema(),
+            urls_to_extract,
+            {
+                "prompt": (
+                    "Extract the brand identity, tone, constraints, ecommerce details, "
+                    "and reusable content atoms from this website."
+                ),
+                "schema": BrandDNA.model_json_schema(),
+            },
         )
 
-        
-        # Check if data was returned and is correctly structured
-        if not data_list or not isinstance(data_list, list) or not data_list[0].get("data"):
-            raise ValueError("Extraction returned empty or poorly structured data from API.")
+        # Normalise the response into a list of results
+        if isinstance(res, dict) and isinstance(res.get("data"), list):
+            data_list = res["data"]
+        elif isinstance(res, list):
+            # Some deployments return a bare list already
+            data_list = res
+        else:
+            raise ValueError(f"Unexpected extract() response type: {type(res)!r}")
 
-        # The result is nested under 'data' in the response list
-        result: Dict[str, Any] = data_list[0].get("data") or {}
-        
+        if not data_list:
+            raise ValueError("Extraction returned no data from Firecrawl.")
+
+        # Typical item shape: {"url": "...", "data": {...BrandDNA...}, ...}
+        first = data_list[0]
+        payload = first.get("data") or first.get("structured") or first
+
+        if not isinstance(payload, dict):
+            raise ValueError("First extract() item did not contain a structured 'data' dict.")
+
+        result: Dict[str, Any] = payload
+
     except Exception as e:
-        # Catching the previous errors (params, attribute) more generically
+        # Catch Firecrawl and parsing issues and fail cleanly
         print(f"❌ Extraction failed. Error: {e}")
         return
+
 
     # --- Verification and Save ---
     if not result.get("company_name"):
@@ -148,20 +302,32 @@ def save_to_db(data: dict, url: str):
     # Pack the "Brand DNA" into the JSON attributes (use .get() for safety)
     attributes = {
         "website": url,
-        "tone": data.get('tone'),
-        "negative_constraints": data.get('negative_constraints'),
-        "tips": data.get('tips'),
-        "myths": data.get('myths'),
-        "hard_sell_offer": data.get('hard_sell_offer'), 
-        "media_approved": True, 
+        "tone": data.get("tone"),
+        "negative_constraints": data.get("negative_constraints"),
+        "tips": data.get("tips"),
+        "myths": data.get("myths"),
+        "hard_sell_offer": data.get("hard_sell_offer"),
+        "media_approved": True,
         "opt_out": False,
-        # Pages we actually fed into the extraction step
+
+        # Pages we actually fed into / extracted from
         "source_pages": data.get("source_pages") or [],
-        # NEW: content theme & pillars suggested by AI (can be overridden later)
+
+        # Content brain: theme, pillars, cadence
         "content_theme": data.get("content_theme"),
         "content_pillars": data.get("content_pillars") or [],
         "suggested_posts_per_week": data.get("suggested_posts_per_week"),
+
+        # Aggregated content atoms
+        "content_atoms": data.get("content_atoms") or {},
+
+        # Ecommerce flags & lightweight catalog
+        "is_ecommerce": data.get("is_ecommerce"),
+        "ecommerce_platform": data.get("ecommerce_platform"),
+        "product_categories": data.get("product_categories") or [],
+        "product_spotlights": data.get("product_spotlights") or [],
     }
+
 
 
 
