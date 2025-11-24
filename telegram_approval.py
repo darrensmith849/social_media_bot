@@ -17,6 +17,11 @@ Client = main.Client
 kget = main.kget
 kset = main.kset
 publish_text_for_client = main.publish_text_for_client
+create_post_candidate = main.create_post_candidate
+get_post_candidate = main.get_post_candidate
+update_post_candidate_status = main.update_post_candidate_status
+update_post_candidate_metadata = main.update_post_candidate_metadata
+
 
 TELEGRAM_BOT_TOKEN = main.TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID = main.TELEGRAM_CHAT_ID
@@ -54,15 +59,21 @@ def _find_client(client_id: str) -> Optional[Client]:
         if c.id == client_id: return c
     return None
 
-def _build_preview_text(c: Client, text_body: str) -> str:
-    return f"🏢 *{c.name}* ({c.industry})\n📍 {c.city}\n\n{text_body}"
+def _build_preview_text(c: Client, text_body: str, category: Optional[str] = None) -> str:
+    header = c.name
+    if category:
+        header = f"{header} · {category.replace('_', ' ').title()}"
+    return f"📋 *{header}*\n\n{text_body}"
 
-def _approval_keyboard():
-    return {"inline_keyboard": [[
-        {"text": "Approve ✅", "callback_data": "approve"},
-        {"text": "Regenerate 🔁", "callback_data": "regen"},
-        {"text": "Customise ✏️", "callback_data": "custom"},
-    ]]} 
+
+def _approval_keyboard(candidate_id: int):
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ Approve", "callback_data": f"approve:{candidate_id}"},
+            {"text": "❌ Reject",  "callback_data": f"reject:{candidate_id}"},
+        ]]
+    }
+
 
 def _generate_ai_post(c: Client, state: Dict[str, Any], custom_prompt: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -112,20 +123,21 @@ def _generate_ai_post(c: Client, state: Dict[str, Any], custom_prompt: Optional[
 
 def _send_preview_message(
     c: Client,
+    candidate_id: int,
     text_body: str,
-    media_url: Optional[str],
+    media_url: str,
     template_key: str,
+    category: Optional[str],
     platforms: List[str],
-    record_state: bool,
 ) -> None:
-    """Send the preview to Telegram and persist state for callbacks."""
+    """Send the preview to Telegram and attach chat/message ids to the candidate metadata."""
     if not TELEGRAM_CHAT_ID:
         return
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": _build_preview_text(c, text_body),
-        "reply_markup": _approval_keyboard(),
+        "text": _build_preview_text(c, text_body, category),
+        "reply_markup": _approval_keyboard(candidate_id),
         "parse_mode": "Markdown",
     }
     data = _post_telegram("sendMessage", payload)
@@ -133,34 +145,84 @@ def _send_preview_message(
         return
 
     msg = data["result"]
-    _set_state(
-        {
-            "status": "pending",
-            "client_id": c.id,
-            "text_body": text_body,
-            "media_url": media_url,
-            "template_key": template_key,
-            "platforms": platforms,
-            "record_state": record_state,
-            "chat_id": msg["chat"]["id"],
-            "message_id": msg["message_id"],
-        }
-    )
+
+    # Persist Telegram message identifiers into candidate metadata
+    try:
+        update_post_candidate_metadata(
+            candidate_id,
+            {
+                "telegram_chat_id": msg["chat"]["id"],
+                "telegram_message_id": msg["message_id"],
+            },
+        )
+    except Exception as e:
+        logger.exception("Failed to update candidate %s metadata: %s", candidate_id, e)
+
 
 
 def handle_scheduled_post(c: Client, record_state: bool = True):
-    if not main.TELEGRAM_APPROVAL_ENABLED:
-        main.publish_once(c, record_state=record_state)
-        return
-
+    """
+    Create a post_candidate and either:
+    - auto-publish (global toggle or approval_mode='auto_silent'), or
+    - send to Telegram for approval.
+    """
     # Generate initial draft using 4-1-1 templates
     templates = main.load_templates()
     count = main.monthly_count(c.id, datetime.now(TZ))
     tpl = main.select_template(templates, c, count)
+
     text_body = main.render_text(tpl["text"], c)
     media_url = c.attributes.get("hero_image_url") or main.FALLBACK_IMAGE_URL
-    
-    _send_preview_message(c, text_body, media_url, tpl["key"], tpl.get("platforms", []), record_state)
+    platforms = tpl.get("platforms", [])
+    category = tpl.get("category")
+    slot_time = datetime.now(TZ)
+
+    # Create candidate row
+    candidate_id = create_post_candidate(
+        client_id=c.id,
+        template_key=tpl["key"],
+        text_body=text_body,
+        media_url=media_url,
+        platforms=platforms,
+        slot_time=slot_time,
+        status="PENDING",
+        metadata={
+            "category": category,
+            "record_state": bool(record_state),
+        },
+    )
+
+    # Per-client approval mode
+    approval_mode = (c.attributes.get("approval_mode") or "always").lower()
+
+    # Global toggle OFF or client in auto_silent -> publish immediately
+    if not main.TELEGRAM_APPROVAL_ENABLED or approval_mode in ("auto_silent",):
+        publish_text_for_client(
+            c,
+            text_body,
+            media_url,
+            tpl["key"],
+            platforms,
+            record_state=record_state,
+        )
+        try:
+            update_post_candidate_status(candidate_id, "APPROVED")
+        except Exception as e:
+            logger.exception("Failed to update candidate %s after auto publish: %s", candidate_id, e)
+        return
+
+    # Otherwise: send to Telegram for approval
+    _send_preview_message(
+        c,
+        candidate_id,
+        text_body,
+        media_url,
+        tpl["key"],
+        category,
+        platforms,
+    )
+
+
 
 # --- Callback Handlers ---
 
@@ -177,43 +239,69 @@ def _edit_message(state):
 def handle_telegram_update(update: Dict[str, Any]):
     if "callback_query" in update:
         cb = update["callback_query"]
-        data = cb.get("data")
-        state = _get_state()
-        
+        data = (cb.get("data") or "").strip()
+
         _post_telegram("answerCallbackQuery", {"callback_query_id": cb["id"]})
-        
-        if not state or state.get("status") != "pending": return
 
-        c = _find_client(state["client_id"])
-        
-        if data == "approve":
-            main.publish_text_for_client(c, state["text_body"], state["media_url"], state["template_key"], state["platforms"], state["record_state"])
-            _post_telegram("editMessageText", {
-                "chat_id": state["chat_id"], "message_id": state["message_id"],
-                "text": f"✅ Published for *{c.name}*", "parse_mode": "Markdown"
-            })
-            _clear_state()
-            
-        elif data == "regen":
-            new_state = _generate_ai_post(c, state)
-            _set_state(new_state)
-            _edit_message(new_state)
-            
-        elif data == "custom":
-            state["status"] = "awaiting_custom"
-            _set_state(state)
-            _post_telegram("sendMessage", {"chat_id": state["chat_id"], "text": "Reply with your instructions:"})
+        # Expect "action:candidate_id"
+        try:
+            action, id_str = data.split(":", 1)
+            candidate_id = int(id_str)
+        except Exception:
+            return
 
-    elif "message" in update:
-        msg = update["message"]
-        text = msg.get("text")
-        state = _get_state()
-        
-        if state and state.get("status") == "awaiting_custom" and text:
-            c = _find_client(state["client_id"])
-            new_state = _generate_ai_post(c, state, custom_prompt=text)
-            new_state["status"] = "pending"
-            _set_state(new_state)
-            _edit_message(new_state)
-            # Confirm receipt
-            _post_telegram("sendMessage", {"chat_id": msg["chat"]["id"], "text": "Updated draft 👆"})
+        candidate = get_post_candidate(candidate_id)
+        if not candidate:
+            # Candidate gone or expired
+            return
+
+        if candidate.get("status") != "PENDING":
+            # Already processed (approved/rejected/timeout)
+            return
+
+        c = _find_client(candidate["client_id"])
+        if not c:
+            update_post_candidate_status(candidate_id, "CANCELLED")
+            return
+
+        meta = candidate.get("metadata") or {}
+        record_state = bool(meta.get("record_state", True))
+        platforms = candidate.get("platforms") or []
+
+        chat_id = meta.get("telegram_chat_id") or cb["message"]["chat"]["id"]
+        message_id = meta.get("telegram_message_id") or cb["message"]["message_id"]
+
+        if action == "approve":
+            publish_text_for_client(
+                c,
+                candidate["text_body"],
+                candidate["media_url"],
+                candidate["template_key"],
+                platforms,
+                record_state=record_state,
+            )
+            update_post_candidate_status(candidate_id, "APPROVED")
+
+            # Remove buttons and confirm
+            _post_telegram(
+                "editMessageReplyMarkup",
+                {"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}},
+            )
+            _post_telegram(
+                "sendMessage",
+                {"chat_id": chat_id, "text": "✅ Approved and scheduled."},
+            )
+
+        elif action == "reject":
+            update_post_candidate_status(candidate_id, "REJECTED")
+
+            _post_telegram(
+                "editMessageReplyMarkup",
+                {"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}},
+            )
+            _post_telegram(
+                "sendMessage",
+                {"chat_id": chat_id, "text": "❌ Rejected. We'll skip this one."},
+            )
+
+    # For now we ignore plain text messages here (no custom/regen flow).
