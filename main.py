@@ -30,17 +30,19 @@ import logging
 import hashlib
 import random
 import json
+import html
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta 
 from zoneinfo import ZoneInfo
 from typing import List, Optional, Dict, Any, Tuple, Callable
+
 
 import yaml
 import requests
 from jinja2 import Environment, BaseLoader, StrictUndefined
 
 from fastapi import FastAPI, Query, Body, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -117,11 +119,29 @@ CREATE TABLE IF NOT EXISTS published_posts (
 CREATE INDEX IF NOT EXISTS idx_pp_client_month ON published_posts (client_id, posted_at);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_pp_client_platform_text ON published_posts (client_id, platform, text_hash);
 
+CREATE TABLE IF NOT EXISTS post_candidates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  client_id TEXT NOT NULL,
+  template_key TEXT NOT NULL,
+  text_body TEXT NOT NULL,
+  media_url TEXT,
+  slot_time TIMESTAMP NOT NULL,
+  status TEXT NOT NULL,
+  platforms TEXT,
+  rejection_reason TEXT,
+  metadata TEXT,
+  created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pc_client_status ON post_candidates (client_id, status);
+CREATE INDEX IF NOT EXISTS idx_pc_slot_status ON post_candidates (slot_time, status);
+
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT
 );
 """
+
 
 # ------------------
 # Templates (The 4-1-1 Implementation)
@@ -151,49 +171,103 @@ post_templates:
   - key: edu_tip
     category: educational
     platforms: [x, facebook, linkedin]
-    text: "💡 {{ attributes.content_theme or (attributes.tone ~ ' insight from ' ~ name) }}: {{ attributes.tips|random if attributes.tips else 'Did you know? Consistency is key to success.' }} #{{ industry|replace(' ','') }} #{{ city|replace(' ','') }}"
+    text: |
+      {{ content_theme or ("Quick tip from " ~ name) }} 💡
+
+      {% set tip = (attributes.tips|random) if attributes.tips else None %}
+      {{ tip or ("Share a practical insight about " ~ industry ~ " that helps your " ~ city ~ " audience.") }}
 
   - key: edu_mythbuster
     category: educational
     platforms: [x, facebook, linkedin]
-    text: "Common myth about {{ industry }}: {{ attributes.myths|random if attributes.myths else 'Most people think it is expensive, but it saves you money in the long run.' }} 🚫 Truth: {{ name }} makes it easy."
+    text: |
+      {% set myth = (attributes.myths|random) if attributes.myths else None %}
+      Myth vs reality in {{ industry }} for {{ city }} 👇
 
-  - key: edu_question
+      {% if myth %}
+      Myth: {{ myth }}
+      Reality: Explain the truth in a friendly, confidence-building way.
+      {% else %}
+      Bust a common misconception your customers have before they work with you.
+      {% endif %}
+
+  - key: edu_pillar_story
     category: educational
     platforms: [x, facebook, linkedin]
-    text: "Question for our {{ city }} friends: What is your biggest challenge with {{ industry }} right now? 👇 let us know below!"
+    text: |
+      {% set pillar = (content_pillars|random) if content_pillars else "Behind the scenes" %}
+      {{ pillar }} – from {{ name }} in {{ city }} 👀
 
-  - key: edu_didyouknow
+      Share a short story or example that brings this pillar to life for your ideal customer.
+
+  - key: edu_faq
     category: educational
     platforms: [x, facebook, linkedin]
-    text: "Did you know? {{ attributes.facts|random if attributes.facts else 'We have been serving ' + city + ' for years.' }} 🌍 {{ (attributes.content_pillars or [])|random if attributes.content_pillars else '' }}"
+    text: |
+      {% set faq = (attributes.content_atoms.faqs|random) 
+            if attributes.content_atoms and attributes.content_atoms.faqs else None %}
+      Common question we get at {{ name }} in {{ city }}:
+
+      {% if faq %}
+      {{ faq }}
+      {% else %}
+      Answer one simple, practical question your {{ city }} clients ask about {{ industry }}.
+      {% endif %}
 
   # --- SOFT SELL (Index 4) ---
-  - key: soft_team
+  - key: soft_story
     category: soft_sell
     platforms: [x, facebook, linkedin]
-    text: "Meet the team behind {{ name }} in {{ city }}! We are passionate about {{ industry }} and helping our community. 👋 {{ attributes.website }}"
+    text: |
+      Why {{ name }} exists in {{ city }} 💭
 
-  - key: soft_behind_scenes
+      {% if attributes.content_atoms and attributes.content_atoms.story_mission %}
+      {{ attributes.content_atoms.story_mission }}
+      {% else %}
+      Share a short origin story that shows your values and how you help people with {{ industry }}.
+      {% endif %}
+
+  - key: soft_social_proof
     category: soft_sell
     platforms: [x, facebook, linkedin]
-    text: "Behind the scenes at {{ name }}... We are busy making things happen for our clients today! 🛠️"
+    text: |
+      A quick win from our community ✨
+
+      Share a recent testimonial, review or success story that proves your {{ industry }} work really helps.
 
   # --- HARD SELL (Index 5) ---
-  - key: hard_cta
+  - key: hard_offer
     category: hard_sell
     platforms: [x, facebook, linkedin]
-    text: "Ready to get started? 🚀 Join {{ name }} today. {{ attributes.offer_text or 'Contact us for a quote.' }} 👉 {{ attributes.admissions_url or attributes.website }}"
+    text: |
+      Ready to take action with {{ name }} in {{ city }}? 💥
 
-  - key: hard_urgency
+      {% if attributes.hard_sell_offer %}
+      {{ attributes.hard_sell_offer }}
+      {% else %}
+      Invite people to book, buy or enquire today – make the next step extremely clear.
+      {% endif %}
+
+  - key: hard_ecom_spotlight
     category: hard_sell
-    platforms: [x, facebook, linkedin]
-    text: "Don't wait! Slots are filling up at {{ name }}. Secure your spot now: {{ attributes.admissions_url or attributes.website }}"
+    platforms: [x, facebook, instagram]
+    text: |
+      {% set product = (attributes.product_spotlights|random) if attributes.product_spotlights else None %}
+      {% if product %}
+      Featured product: {{ product.name }} 🛒
+
+      {{ product.short_benefit }}
+      {% if product.url %}Shop now: {{ product.url }}{% endif %}
+      {% else %}
+      Highlight one hero product or package your {{ industry }} customers love and include a clear call to action.
+      {% endif %}
 """
+
 
 # ------------------
 # Data model
 # ------------------
+@dataclass
 @dataclass
 class Client:
     id: str
@@ -201,8 +275,18 @@ class Client:
     industry: str
     city: str
     attributes: Dict[str, Any] = field(default_factory=dict)
-    # attributes usually contains: website, phone, email, negative_constraints, tone, tips (list), myths (list)
-    
+    # attributes usually contains:
+    #   website, phone, email
+    #   tone, negative_constraints, tips (list), myths (list)
+    #   content_theme, content_pillars, suggested_posts_per_week
+    #   content_atoms, is_ecommerce, ecommerce_platform
+    #   product_categories, product_spotlights
+    #   cooldown_days, max_posts_per_month
+    #   approval_mode, approval_channel, on_approval_timeout
+    #   media_approved, opt_out, etc.
+
+    # --- Base flags ---
+
     @property
     def media_approved(self) -> bool:
         return self.attributes.get("media_approved", True)
@@ -210,6 +294,170 @@ class Client:
     @property
     def opt_out(self) -> bool:
         return self.attributes.get("opt_out", False)
+
+    # --- Brand DNA convenience accessors ---
+
+    @property
+    def content_theme(self) -> Optional[str]:
+        return self.attributes.get("content_theme")
+
+    @property
+    def content_pillars(self) -> List[str]:
+        return self.attributes.get("content_pillars") or []
+
+    @property
+    def suggested_posts_per_week(self) -> Optional[int]:
+        return self.attributes.get("suggested_posts_per_week")
+
+    @property
+    def tone(self) -> Optional[str]:
+        return self.attributes.get("tone")
+
+    @property
+    def negative_constraints(self) -> Optional[str]:
+        return self.attributes.get("negative_constraints")
+
+    @property
+    def tips(self) -> List[str]:
+        return self.attributes.get("tips") or []
+
+    @property
+    def myths(self) -> List[str]:
+        return self.attributes.get("myths") or []
+
+    @property
+    def content_atoms(self) -> Dict[str, Any]:
+        """
+        Normalise content_atoms to a dict so Jinja usage like
+        attributes.content_atoms.story_mission works reliably.
+        """
+        atoms = self.attributes.get("content_atoms") or {}
+        if isinstance(atoms, dict):
+            return atoms
+        return {}
+
+    # --- Ecommerce helpers ---
+
+    @property
+    def is_ecommerce(self) -> bool:
+        return bool(self.attributes.get("is_ecommerce"))
+
+    @property
+    def ecommerce_platform(self) -> Optional[str]:
+        return self.attributes.get("ecommerce_platform")
+
+    @property
+    def product_categories(self) -> List[str]:
+        return self.attributes.get("product_categories") or []
+
+    @property
+    def product_spotlights(self) -> List[Dict[str, Any]]:
+        spotlights = self.attributes.get("product_spotlights") or []
+        if isinstance(spotlights, list):
+            return spotlights
+        return []
+
+    # --- Posting rules (per-client) ---
+
+    @property
+    def cooldown_days(self) -> int:
+        from main import COOLDOWN_DAYS  # avoid circular import at module load
+        try:
+            return int(self.attributes.get("cooldown_days", COOLDOWN_DAYS))
+        except (TypeError, ValueError):
+            return COOLDOWN_DAYS
+
+    @property
+    def max_posts_per_month(self) -> int:
+        from main import PER_CLIENT_MONTHLY_CAP
+        try:
+            return int(self.attributes.get("max_posts_per_month", PER_CLIENT_MONTHLY_CAP))
+        except (TypeError, ValueError):
+            return PER_CLIENT_MONTHLY_CAP
+
+    # --- Approval settings (per-client) ---
+
+    @property
+    def approval_mode(self) -> str:
+        """
+        'always', 'first_n', 'auto_with_notifications', 'auto_silent'
+        """
+        value = self.attributes.get("approval_mode") or "always"
+        return str(value).lower()
+
+    @property
+    def approval_channel(self) -> str:
+        """
+        'telegram', 'web', 'both' (currently primarily 'telegram')
+        """
+        value = self.attributes.get("approval_channel") or "telegram"
+        return str(value).lower()
+
+    @property
+    def on_approval_timeout(self) -> str:
+        """
+        'auto_post', 'auto_cancel', 'fallback'
+        (hooked in when we wire full timeout logic)
+        """
+        value = self.attributes.get("on_approval_timeout") or "auto_post"
+        return str(value).lower()
+
+
+    # --- Brand DNA convenience accessors ---
+
+    @property
+    def content_theme(self) -> Optional[str]:
+        return self.attributes.get("content_theme")
+
+    @property
+    def content_pillars(self) -> List[str]:
+        return self.attributes.get("content_pillars") or []
+
+    @property
+    def suggested_posts_per_week(self) -> Optional[int]:
+        return self.attributes.get("suggested_posts_per_week")
+
+    @property
+    def negative_constraints(self) -> Optional[str]:
+        return self.attributes.get("negative_constraints")
+
+    @property
+    def tips(self) -> List[str]:
+        return self.attributes.get("tips") or []
+
+    @property
+    def myths(self) -> List[str]:
+        return self.attributes.get("myths") or []
+
+    @property
+    def content_atoms(self) -> Dict[str, Any]:
+        # Normalise to a dict to make Jinja rendering easier
+        atoms = self.attributes.get("content_atoms") or {}
+        if isinstance(atoms, dict):
+            return atoms
+        return {}
+
+    # --- Ecommerce helpers ---
+
+    @property
+    def is_ecommerce(self) -> bool:
+        return bool(self.attributes.get("is_ecommerce"))
+
+    @property
+    def ecommerce_platform(self) -> Optional[str]:
+        return self.attributes.get("ecommerce_platform")
+
+    @property
+    def product_categories(self) -> List[str]:
+        return self.attributes.get("product_categories") or []
+
+    @property
+    def product_spotlights(self) -> List[Dict[str, Any]]:
+        # Ensure we always get a list of dicts for Jinja
+        spotlights = self.attributes.get("product_spotlights") or []
+        if isinstance(spotlights, list):
+            return spotlights
+        return []
 
 # ------------------
 # Util functions
@@ -242,6 +490,7 @@ def month_bounds(dt: datetime) -> Tuple[datetime, datetime]:
 def text_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+
 def already_recorded(client_id: str, platform: str, text_body: str) -> bool:
     th = text_hash(text_body)
     with STATE_ENGINE.begin() as conn:
@@ -251,10 +500,166 @@ def already_recorded(client_id: str, platform: str, text_body: str) -> bool:
         ).fetchone()
     return bool(row)
 
+
+# ------------------
+# KV helpers (used by Telegram, etc.)
+# ------------------
+def kget(key: str) -> Optional[str]:
+    with STATE_ENGINE.begin() as conn:
+        row = conn.execute(
+            text("SELECT v FROM kv WHERE k = :k LIMIT 1"),
+            {"k": key},
+        ).fetchone()
+    return row[0] if row else None
+
+
+def kset(key: str, value: str) -> None:
+    with STATE_ENGINE.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO kv(k, v) VALUES (:k, :v) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v"
+            ),
+            {"k": key, "v": value},
+        )
+
+
+# ------------------
+# Post candidate helpers (drafts)
+# ------------------
+def create_post_candidate(
+    client_id: str,
+    template_key: str,
+    text_body: str,
+    media_url: Optional[str],
+    platforms: Optional[List[str]],
+    slot_time: datetime,
+    status: str = "PENDING",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> int:
+    """
+    Create a draft candidate row and return its id.
+    """
+    now = datetime.now(TZ)
+    platforms_json = json.dumps(platforms) if platforms else None
+    meta_json = json.dumps(metadata or {})
+    with STATE_ENGINE.begin() as conn:
+        row = conn.execute(
+            text(
+                "INSERT INTO post_candidates("
+                "client_id, template_key, text_body, media_url, slot_time, "
+                "status, platforms, rejection_reason, metadata, created_at, updated_at"
+                ") VALUES (:cid, :tk, :tb, :mu, :slot, :st, :pf, :rr, :md, :ts, :ts) "
+                "RETURNING id"
+            ),
+            {
+                "cid": client_id,
+                "tk": template_key,
+                "tb": text_body,
+                "mu": media_url,
+                "slot": slot_time,
+                "st": status,
+                "pf": platforms_json,
+                "rr": None,
+                "md": meta_json,
+                "ts": now,
+            },
+        ).fetchone()
+    return int(row[0])
+
+
+def get_post_candidate(candidate_id: int) -> Optional[Dict[str, Any]]:
+    with STATE_ENGINE.begin() as conn:
+        row = conn.execute(
+            text("SELECT * FROM post_candidates WHERE id = :id"),
+            {"id": candidate_id},
+        ).mappings().first()
+    if not row:
+        return None
+
+    data = dict(row)
+
+    # Decode JSON-like fields
+    platforms_raw = data.get("platforms")
+    if isinstance(platforms_raw, str):
+        try:
+            data["platforms"] = json.loads(platforms_raw) or []
+        except Exception:
+            data["platforms"] = []
+    else:
+        data["platforms"] = platforms_raw or []
+
+    meta_raw = data.get("metadata")
+    if isinstance(meta_raw, str):
+        try:
+            data["metadata"] = json.loads(meta_raw) or {}
+        except Exception:
+            data["metadata"] = {}
+    else:
+        data["metadata"] = meta_raw or {}
+
+    return data
+
+
+def update_post_candidate_status(
+    candidate_id: int,
+    status: str,
+    rejection_reason: Optional[str] = None,
+) -> None:
+    with STATE_ENGINE.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE post_candidates "
+                "SET status = :st, "
+                "    rejection_reason = COALESCE(:rr, rejection_reason), "
+                "    updated_at = :ts "
+                "WHERE id = :id"
+            ),
+            {
+                "id": candidate_id,
+                "st": status,
+                "rr": rejection_reason,
+                "ts": datetime.now(TZ),
+            },
+        )
+
+
+def update_post_candidate_metadata(candidate_id: int, updates: Dict[str, Any]) -> None:
+    with STATE_ENGINE.begin() as conn:
+        row = conn.execute(
+            text("SELECT metadata FROM post_candidates WHERE id = :id"),
+            {"id": candidate_id},
+        ).fetchone()
+        if not row:
+            return
+
+        raw = row[0] or "{}"
+        try:
+            meta = json.loads(raw) or {}
+        except Exception:
+            meta = {}
+
+        meta.update(updates or {})
+
+        conn.execute(
+            text(
+                "UPDATE post_candidates "
+                "SET metadata = :md, updated_at = :ts "
+                "WHERE id = :id"
+            ),
+            {
+                "id": candidate_id,
+                "md": json.dumps(meta),
+                "ts": datetime.now(TZ),
+            },
+        )
+
+
 # ------------------
 # DB ingest
 # ------------------
 MAIN_ENGINE: Optional[Engine] = None
+
 
 def _sample_clients_for_dry() -> List[Client]:
     return [
@@ -347,43 +752,83 @@ def build_env() -> Environment:
     env.filters["random"] = lambda seq: random.choice(seq) if seq else ""
     return env
 
+
+def recent_template_keys(client_id: str, limit: int = 8) -> List[str]:
+    """
+    Return the most recent template keys used for this client, newest first.
+    Used to avoid hammering the same template repeatedly.
+    """
+    with STATE_ENGINE.begin() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT template_key "
+                "FROM published_posts "
+                "WHERE client_id = :cid "
+                "ORDER BY posted_at DESC "
+                "LIMIT :lim"
+            ),
+            {"cid": client_id, "lim": limit},
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
 def select_template(templates: Dict[str, Any], client: Client, monthly_count: int) -> Dict[str, Any]:
     """
     Implements the 4-1-1 Rule based on monthly post count.
+
     Cycle of 6 posts:
-    0, 1, 2, 3 -> Educational
-    4 -> Soft Sell
-    5 -> Hard Sell
+    0,1,2,3 -> educational
+    4       -> soft_sell
+    5       -> hard_sell
     """
     cycle_index = monthly_count % 6
-    
-    target_category = "educational"
+
     if cycle_index == 4:
         target_category = "soft_sell"
     elif cycle_index == 5:
         target_category = "hard_sell"
-        
+    else:
+        target_category = "educational"
+
+    # Start with templates in the target category
     candidates = [t for t in templates.values() if t.get("category") == target_category]
-    
+
     # Fallback if category missing
     if not candidates:
         candidates = list(templates.values())
 
-    # Deterministic choice based on day/client
+    # Light diversity: avoid hammering the same template key
+    try:
+        recent_keys = recent_template_keys(client.id, limit=8)
+    except Exception:
+        recent_keys = []
+
+    # Avoid the last 3 keys if we have alternatives
+    recent_avoid = set(recent_keys[:3])
+    fresh = [t for t in candidates if t.get("key") not in recent_avoid]
+    pool = fresh or candidates
+
+    # Deterministic-ish choice based on day/client
     seed = int(datetime.now(TZ).strftime("%Y%m%d")) ^ hash(client.id)
     rng = random.Random(seed)
-    return rng.choice(candidates)
+    return rng.choice(pool)
+
 
 def render_text(tpl_text: str, client: Client) -> str:
     env = build_env()
+    attrs = client.attributes or {}
     ctx = {
         "name": client.name,
         "city": client.city,
         "industry": client.industry,
-        "attributes": client.attributes
+        "attributes": attrs,
+        # Shortcuts for brand DNA
+        "content_theme": attrs.get("content_theme"),
+        "content_pillars": attrs.get("content_pillars") or [],
     }
     template = env.from_string(tpl_text)
     return template.render(**ctx).strip()
+
 
 # ------------------
 # Publishers
@@ -437,10 +882,172 @@ def monthly_count(client_id: str, when: datetime) -> int:
     start, end = month_bounds(when)
     with STATE_ENGINE.begin() as conn:
         row = conn.execute(
-            text("SELECT COUNT(*) FROM published_posts WHERE client_id=:cid AND posted_at>=:start AND posted_at<:end"),
+            text(
+                "SELECT COUNT(*) FROM published_posts "
+                "WHERE client_id=:cid AND posted_at>=:start AND posted_at<:end"
+            ),
             {"cid": client_id, "start": start, "end": end},
         ).fetchone()
-        return int(row[0]) if row else 0
+    return int(row[0]) if row else 0
+
+
+def compute_rejection_patterns(
+    window_days: int = 30,
+    client_id: Optional[str] = None,
+    min_rejections_per_template: int = 2,
+) -> Dict[str, Any]:
+    """Analyse REJECTED post_candidates and surface pattern suggestions.
+
+    Returns a JSON-serialisable dict with:
+      - total_rejections
+      - templates: list of {template_key, total_rejections, reason_counts}
+      - negative_constraints_suggestions
+      - tone_suggestions
+    """
+    now = datetime.now(TZ)
+    start = now - timedelta(days=window_days)
+
+    try:
+        conditions = ["status = 'REJECTED'", "updated_at >= :start"]
+        params: Dict[str, Any] = {"start": start}
+
+        if client_id:
+            conditions.append("client_id = :cid")
+            params["cid"] = client_id
+
+        where_clause = " AND ".join(conditions)
+        sql = text(
+            "SELECT client_id, template_key, rejection_reason "
+            "FROM post_candidates "
+            f"WHERE {where_clause}"
+        )
+
+        with STATE_ENGINE.begin() as conn:
+            rows = conn.execute(sql, params).mappings().all()
+    except Exception as e:
+        logger.exception("Pattern learner query failed: %s", e)
+        return {
+            "generated_at": now.isoformat(),
+            "window_days": window_days,
+            "client_id": client_id,
+            "total_rejections": 0,
+            "templates": [],
+            "negative_constraints_suggestions": [],
+            "tone_suggestions": [],
+        }
+
+    if not rows:
+        return {
+            "generated_at": now.isoformat(),
+            "window_days": window_days,
+            "client_id": client_id,
+            "total_rejections": 0,
+            "templates": [],
+            "negative_constraints_suggestions": [],
+            "tone_suggestions": [],
+        }
+
+    from collections import Counter, defaultdict
+
+    per_template: Dict[str, List[str]] = defaultdict(list)
+    for r in rows:
+        tpl = r["template_key"]
+        reason = (r.get("rejection_reason") or "").strip()
+        per_template[tpl].append(reason)
+
+    def bucket_reason(reason: str) -> str:
+        if not reason:
+            return "unspecified"
+        low = reason.lower()
+        if "salesy" in low or "pushy" in low or "hard sell" in low:
+            return "too_salesy"
+        if "tone" in low or "voice" in low or "formal" in low or "casual" in low:
+            return "wrong_tone"
+        if "off-topic" in low or "off topic" in low or "irrelevant" in low:
+            return "off_topic"
+        if "long" in low or "wordy" in low:
+            return "too_long"
+        if "short" in low or "thin" in low:
+            return "too_short"
+        if "repeat" in low or "repetitive" in low or "boring" in low:
+            return "repetitive"
+        return "other"
+
+    templates_summary: List[Dict[str, Any]] = []
+    negative_constraints_suggestions: set = set()
+    tone_suggestions: set = set()
+
+    for tpl_key, reasons in per_template.items():
+        if len(reasons) < min_rejections_per_template:
+            continue
+        buckets = [bucket_reason(r) for r in reasons]
+        counts = Counter(buckets)
+        total = len(reasons)
+
+        templates_summary.append(
+            {
+                "template_key": tpl_key,
+                "total_rejections": total,
+                "reason_counts": dict(counts),
+            }
+        )
+
+        top_reason, _ = counts.most_common(1)[0]
+
+        if top_reason == "too_salesy":
+            negative_constraints_suggestions.add(
+                "Avoid overly pushy or hard-sell language in everyday posts."
+            )
+        if top_reason == "wrong_tone":
+            tone_suggestions.add(
+                "Adjust the tone to be closer to how the client naturally speaks (less hype, more plain language)."
+            )
+        if top_reason == "off_topic":
+            negative_constraints_suggestions.add(
+                "Avoid posts that drift away from the brand's core services or audience problems."
+            )
+        if top_reason == "repetitive":
+            negative_constraints_suggestions.add(
+                "Avoid repeating the same hook or promise across multiple posts in a short period."
+            )
+
+    return {
+        "generated_at": now.isoformat(),
+        "window_days": window_days,
+        "client_id": client_id,
+        "total_rejections": len(rows),
+        "templates": templates_summary,
+        "negative_constraints_suggestions": sorted(negative_constraints_suggestions),
+        "tone_suggestions": sorted(tone_suggestions),
+    }
+
+
+def run_rejection_pattern_learner(window_days: int = 30) -> None:
+    """Periodic job that logs pattern suggestions globally and per client."""
+    global_summary = compute_rejection_patterns(window_days=window_days, client_id=None)
+    logger.info("Global rejection patterns: %s", json.dumps(global_summary))
+
+    # Per-client summaries for clients with recent rejections
+    now = datetime.now(TZ)
+    start = now - timedelta(days=window_days)
+    try:
+        with STATE_ENGINE.begin() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT DISTINCT client_id "
+                    "FROM post_candidates "
+                    "WHERE status = 'REJECTED' AND updated_at >= :start"
+                ),
+                {"start": start},
+            ).fetchall()
+    except Exception as e:
+        logger.exception("Pattern learner client discovery failed: %s", e)
+        return
+
+    for (client_id,) in rows:
+        summary = compute_rejection_patterns(window_days=window_days, client_id=client_id)
+        logger.info("Rejection patterns for client %s: %s", client_id, json.dumps(summary))
+
 
 def choose_client_for_slot(clients: List[Client]) -> Optional[Client]:
     now = datetime.now(TZ)
@@ -450,9 +1057,11 @@ def choose_client_for_slot(clients: List[Client]) -> Optional[Client]:
     for c in clients:
         if c.opt_out or not c.media_approved:
             continue
-        cooldown_days = int(c.attributes.get("cooldown_days", COOLDOWN_DAYS))
-        if not already_posted_recently(c.id, cooldown_days):
-            eligible.append(c)
+        if not already_posted_recently(c.id, c.cooldown_days):
+            continue
+        # NOTE: already_posted_recently returns True if we *have* a recent post,
+        # so we only keep clients that are NOT blocked by cooldown.
+        eligible.append(c)
 
     if not eligible:
         logger.info("No eligible clients after cooldown/opt-out filtering.")
@@ -460,23 +1069,21 @@ def choose_client_for_slot(clients: List[Client]) -> Optional[Client]:
     
     # Cap check (per-client monthly caps)
     counts: Dict[str, int] = {c.id: monthly_count(c.id, now) for c in eligible}
-    caps: Dict[str, int] = {
-        c.id: int(c.attributes.get("max_posts_per_month", PER_CLIENT_MONTHLY_CAP))
-        for c in eligible
-    }
+    caps: Dict[str, int] = {c.id: c.max_posts_per_month for c in eligible}
 
     pool = [c for c in eligible if counts[c.id] < caps[c.id]]
     if not pool:
         logger.info("No eligible clients after monthly cap filtering.")
         return None
     
-    # Prioritize lowest count
+    # Prioritise lowest count
     min_c = min(counts[c.id] for c in pool)
     shortlist = [c for c in pool if counts[c.id] == min_c]
     
     rng = random.Random(now.strftime("%Y%m%d"))
     rng.shuffle(shortlist)
     return shortlist[0]
+
 
 
 def record_published(client_id: str, platform: str, template_key: str, text_body: str, external_id: Optional[str]) -> None:
@@ -518,7 +1125,11 @@ def publish_once(c: Client, record_state: bool = True) -> List[PublishResult]:
 # ------------------
 SCHED = BackgroundScheduler(timezone=str(TZ))
 
+
 def run_rotation_post(record_state: bool = True):
+    """
+    Pick a client for this slot and create/send a candidate.
+    """
     clients = fetch_clients()
     choice = choose_client_for_slot(clients)
     if not choice:
@@ -532,8 +1143,82 @@ def run_rotation_post(record_state: bool = True):
         logger.info("telegram_approval not available, publishing directly.")
         publish_once(choice, record_state=record_state)
     except Exception:
-        logger.exception("Scheduled post failed via Telegram approval, falling back to direct publish.")
-        publish_once(choice, record_state=record_state)
+        logger.exception("handle_scheduled_post failed", exc_info=True)
+
+
+def run_approval_timeouts(grace_minutes: int = 10) -> None:
+    """
+    Sweep PENDING post_candidates whose slot_time is older than `grace_minutes`
+    and apply per-client timeout behaviour:
+
+    - on_approval_timeout = 'auto_post'   -> auto-approve + publish
+    - on_approval_timeout = 'auto_cancel' -> mark TIMEOUT, skip
+    - on_approval_timeout = 'fallback'    -> mark TIMEOUT, publish a safe evergreen via publish_once()
+    """
+    now = datetime.now(TZ)
+    cutoff = now - timedelta(minutes=grace_minutes)
+
+    with STATE_ENGINE.begin() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT id, client_id, template_key, text_body, media_url, platforms "
+                "FROM post_candidates "
+                "WHERE status = 'PENDING' AND slot_time <= :cutoff"
+            ),
+            {"cutoff": cutoff},
+        ).mappings().all()
+
+    if not rows:
+        return
+
+    clients_by_id = {c.id: c for c in fetch_clients()}
+
+    for row in rows:
+        candidate_id = row["id"]
+        client = clients_by_id.get(row["client_id"])
+        if not client:
+            update_post_candidate_status(candidate_id, "TIMEOUT")
+            logger.info("Candidate %s timed out (client missing).", candidate_id)
+            continue
+
+        timeout_mode = (client.attributes.get("on_approval_timeout") or "auto_post").lower()
+
+        platforms = row.get("platforms")
+        if isinstance(platforms, str):
+            try:
+                platforms = json.loads(platforms) or []
+            except Exception:
+                platforms = []
+        else:
+            platforms = platforms or []
+
+        if timeout_mode == "auto_cancel":
+            update_post_candidate_status(candidate_id, "TIMEOUT")
+            logger.info("Candidate %s auto-cancelled on timeout.", candidate_id)
+
+        elif timeout_mode == "fallback":
+            update_post_candidate_status(candidate_id, "TIMEOUT")
+            logger.info("Candidate %s timed out; publishing fallback for client %s.", candidate_id, client.id)
+            try:
+                publish_once(client, record_state=True)
+            except Exception:
+                logger.exception("Fallback publish failed for client %s", client.id)
+
+        else:  # 'auto_post' (default)
+            logger.info("Candidate %s auto-posting on timeout.", candidate_id)
+            try:
+                publish_text_for_client(
+                    client,
+                    row["text_body"],
+                    row["media_url"],
+                    row["template_key"],
+                    platforms,
+                    record_state=True,
+                )
+                update_post_candidate_status(candidate_id, "APPROVED")
+            except Exception:
+                logger.exception("Auto-post on timeout failed for candidate %s", candidate_id)
+
 
 
 def schedule_today_slots():
@@ -557,9 +1242,12 @@ async def lifespan(app: FastAPI):
     ensure_bootstrap()
     schedule_today_slots()
     SCHED.add_job(schedule_today_slots, "cron", hour=0, minute=5)
+    # Periodic pattern learner over rejected posts (once a day)
+    SCHED.add_job(run_rejection_pattern_learner, "cron", hour=3, minute=0)
     SCHED.start()
 
     if DRY_RUN or TELEGRAM_PREVIEW_ON_STARTUP:
+
         logger.info(
             "Running startup preview: DRY_RUN=%s, TELEGRAM_PREVIEW_ON_STARTUP=%s, TELEGRAM_APPROVAL_ENABLED=%s",
             DRY_RUN,
@@ -603,6 +1291,121 @@ def dry_run(count: int = Query(3)):
             "text": render_text(tpl["text"], c),
         })
     return {"posts": items}
+
+
+@app.get("/rejections", response_class=HTMLResponse)
+def view_rejections(
+    client_id: Optional[str] = Query(None),
+    reason: Optional[str] = Query(None),
+    template_key: Optional[str] = Query(None),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Simple HTML view of rejected post candidates, globally or per client."""
+
+    def _parse_dt(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+
+    start_dt = _parse_dt(start)
+    end_dt = _parse_dt(end)
+
+    conditions = ["status = 'REJECTED'"]
+    params: Dict[str, Any] = {"limit": limit}
+
+    if client_id:
+        conditions.append("client_id = :client_id")
+        params["client_id"] = client_id
+    if template_key:
+        conditions.append("template_key = :template_key")
+        params["template_key"] = template_key
+    if reason:
+        conditions.append("rejection_reason LIKE :reason")
+        params["reason"] = f"%{reason}%"
+    if start_dt:
+        conditions.append("updated_at >= :start")
+        params["start"] = start_dt
+    if end_dt:
+        conditions.append("updated_at <= :end")
+        params["end"] = end_dt
+
+    where_clause = " AND ".join(conditions)
+
+    try:
+        with STATE_ENGINE.begin() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT client_id, template_key, text_body, rejection_reason, slot_time, updated_at "
+                    "FROM post_candidates "
+                    f"WHERE {where_clause} "
+                    "ORDER BY updated_at DESC "
+                    "LIMIT :limit"
+                ),
+                params,
+            ).mappings().all()
+    except Exception as e:
+        logger.exception("Failed to render /rejections view: %s", e)
+        return HTMLResponse(
+            f"<html><body><h1>Error</h1><p>{html.escape(str(e))}</p></body></html>"
+        )
+
+    clients_by_id = {c.id: c for c in fetch_clients()}
+
+    parts = [
+        "<html><head><title>Rejected posts</title></head><body>",
+        "<h1>Rejected posts</h1>",
+    ]
+
+    if client_id:
+        client = clients_by_id.get(client_id)
+        label = client.name if client else client_id
+        parts.append(f"<p>Client: {html.escape(str(label))}</p>")
+
+    if not rows:
+        parts.append("<p>No rejected posts found for the selected filters.</p>")
+        parts.append("</body></html>")
+        return "".join(parts)
+
+    parts.append("<table border='1' cellspacing='0' cellpadding='4'>")
+    parts.append(
+        "<tr><th>Client</th><th>Template</th><th>Reason</th><th>Snippet</th><th>Slot time</th><th>Updated at</th></tr>"
+    )
+
+    for r in rows:
+        client = clients_by_id.get(r["client_id"])
+        client_label = client.name if client else r["client_id"]
+        body = r.get("text_body") or ""
+        snippet = body[:180] + ("…" if len(body) > 180 else "")
+
+        parts.append(
+            "<tr>"
+            f"<td>{html.escape(str(client_label))}</td>"
+            f"<td>{html.escape(str(r['template_key']))}</td>"
+            f"<td>{html.escape(str(r.get('rejection_reason') or ''))}</td>"
+            f"<td>{html.escape(snippet)}</td>"
+            f"<td>{html.escape(str(r.get('slot_time') or ''))}</td>"
+            f"<td>{html.escape(str(r.get('updated_at') or ''))}</td>"
+            "</tr>"
+        )
+
+    parts.append("</table></body></html>")
+    return "".join(parts)
+
+
+@app.get("/rejections/patterns")
+def get_rejection_patterns(
+    client_id: Optional[str] = Query(None),
+    window_days: int = Query(30, ge=1, le=365),
+):
+    """Return rejection pattern suggestions for the last N days."""
+    summary = compute_rejection_patterns(window_days=window_days, client_id=client_id)
+    return summary
+
 
 
 @app.post("/clients/{client_id}/attributes/merge")
