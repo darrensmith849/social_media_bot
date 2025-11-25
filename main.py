@@ -42,8 +42,9 @@ import requests
 from requests_oauthlib import OAuth1Session
 from jinja2 import Environment, BaseLoader, StrictUndefined
 
-from fastapi import FastAPI, Query, Body, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, Query, Body, HTTPException, Request
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
 
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -850,21 +851,53 @@ class ConsolePublisher(Publisher):
 
 class XPublisher(Publisher):
     platform = "x"
-    def __init__(self, bearer: Optional[str]):
-        self.bearer = bearer
+    def __init__(self, client_config: Dict[str, Any]):
+        # We now look for keys inside the CLIENT'S attributes, not the global env
+        self.consumer_key = os.getenv("X_CONSUMER_KEY") # The App Key is global (Yours)
+        self.consumer_secret = os.getenv("X_CONSUMER_SECRET") # The App Secret is global (Yours)
+        
+        # These are specific to the CLIENT (Joe's Tokens)
+        self.access_token = client_config.get("x_access_token")
+        self.access_token_secret = client_config.get("x_access_token_secret")
+
     def publish(self, text: str, media_url: Optional[str] = None) -> PublishResult:
         MAX = 280
         if len(text) > MAX: text = text[: MAX - 1] + "…"
-        if DRY_RUN or not self.bearer:
-            logger.info("[DRY] x | %s", text)
+        
+        # If running dry run or missing keys, just log it
+        if DRY_RUN or not (self.consumer_key and self.access_token):
+            logger.info("[DRY] x | %s (No tokens found for this client)", text)
             return PublishResult({"platform": self.platform, "id": None, "text": text})
-        # Skeleton real publish
-        return PublishResult({"platform": self.platform, "id": "12345", "text": text})
 
-def build_publishers() -> list[Publisher]:
+        try:
+            twitter = OAuth1Session(
+                self.consumer_key,
+                client_secret=self.consumer_secret,
+                resource_owner_key=self.access_token,
+                resource_owner_secret=self.access_token_secret,
+            )
+            payload = {"text": text}
+            response = twitter.post("https://api.twitter.com/2/tweets", json=payload)
+
+            if response.status_code != 201:
+                logger.error("X Post Failed: %s", response.text)
+                return PublishResult({"platform": self.platform, "id": None, "text": text, "error": response.text})
+
+            data = response.json()
+            tweet_id = data.get("data", {}).get("id")
+            return PublishResult({"platform": self.platform, "id": tweet_id, "text": text})
+        except Exception as e:
+            logger.error("X Exception: %s", e)
+            return PublishResult({"platform": self.platform, "id": None, "text": text, "error": str(e)})
+
+def build_publishers(client: Client) -> list[Publisher]:
     pubs = [ConsolePublisher()]
-    if ENABLE_X and SET.x_bearer_token:
-        pubs.append(XPublisher(SET.x_bearer_token))
+    
+    # Check if X is enabled globally AND if the client has tokens
+    if ENABLE_X:
+        # Pass the client's attributes to the publisher
+        pubs.append(XPublisher(client.attributes))
+        
     return pubs
 
 # ------------------
@@ -1097,7 +1130,7 @@ def record_published(client_id: str, platform: str, template_key: str, text_body
 
 def publish_text_for_client(c: Client, text_body: str, media_url: Optional[str], template_key: str, platforms: Optional[List[str]] = None, record_state: bool = True) -> List[PublishResult]:
     results = []
-    for pub in build_publishers():
+    for pub in build_publishers(c):
         if isinstance(pub, ConsolePublisher) or not platforms or pub.platform in platforms:
             try:
                 if record_state and already_recorded(c.id, pub.platform, text_body):
@@ -1270,6 +1303,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Universal Agency Bot", lifespan=lifespan)
 
+# SECURITY WARNING: In production, change "super-secret-key" to a real random string!
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("API_SECRET_KEY", "super-secret-key"))
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.now(TZ).isoformat(), "dry_run": DRY_RUN}
@@ -1459,6 +1494,46 @@ async def telegram_webhook(update: Dict[str, Any]):
     except Exception as e:
         logger.exception("Webhook failed: %s", e)
     return {"ok": True}
+
+# ------------------
+# OAuth / Connect Routes
+# ------------------
+
+@app.get("/auth/{platform}/login")
+def auth_login(platform: str, client_id: str, request: Request):
+    """
+    Step 1: The Frontend 'Connect' button sends the user here.
+    We save the 'client_id' in a cookie/session so we know who is connecting
+    when they come back from Facebook/LinkedIn.
+    """
+    if platform not in ["facebook", "linkedin", "x"]:
+        raise HTTPException(status_code=400, detail="Unsupported platform")
+    
+    # Save the client_id in the session
+    request.session["connecting_client_id"] = client_id
+    
+    # TODO: Generate the real Redirect URL for the specific platform
+    # For now, we return a dummy URL to prove the route works
+    return {"url": f"https://example.com/mock-login/{platform}?client_id={client_id}"}
+
+
+@app.get("/auth/{platform}/callback")
+def auth_callback(platform: str, code: str, state: Optional[str] = None, request: Request = None):
+    """
+    Step 2: The Platform sends the user back here with a 'code'.
+    We swap that code for a permanent Token.
+    """
+    client_id = request.session.get("connecting_client_id")
+    if not client_id:
+        return HTMLResponse("Error: Session lost. Please try again.", status_code=400)
+    
+    logger.info(f"Received callback for {platform} (Client: {client_id}) Code: {code}")
+
+    # TODO: 
+    # 1. Swap 'code' for 'access_token' using the platform's API
+    # 2. Save 'access_token' into the DB for this client_id
+    
+    return HTMLResponse(f"<h1>Success!</h1><p>Connected {platform} for client {client_id}. You can close this window.</p>")
 
 
 if __name__ == "__main__":
