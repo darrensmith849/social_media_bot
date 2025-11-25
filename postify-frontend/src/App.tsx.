@@ -1,0 +1,26 @@
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { AppLayout } from "./components/AppLayout";
+import { DashboardPage } from "./pages/DashboardPage";
+import { ClientOverviewPage } from "./pages/ClientOverviewPage";
+import { ClientApprovalsPage } from "./pages/ClientApprovalsPage";
+import { ClientSettingsPage } from "./pages/ClientSettingsPage";
+
+function App() {
+  return (
+    <BrowserRouter>
+      <AppLayout>
+        <Routes>
+          <Route path="/" element={<DashboardPage />} />
+          <Route path="/clients/:clientId" element={<ClientOverviewPage />} />
+          <Route path="/clients/:clientId/approvals" element={<ClientApprovalsPage />} />
+          {/* This is the new line we needed to add: */}
+          <Route path="/clients/:clientId/settings" element={<ClientSettingsPage />} />
+          
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AppLayout>
+    </BrowserRouter>
+  );
+}
+
+export default App;
