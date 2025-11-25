@@ -1505,11 +1505,65 @@ oauth_tokens = {}
 
 @app.get("/auth/{platform}/login")
 def auth_login(platform: str, client_id: str, request: Request):
-    if platform != "x":
-        return HTMLResponse("Only X (Twitter) is supported in this version.", status_code=400)
-    
-    # 1. Get Consumer Keys from Env
-    consumer_key = os.getenv("X_CONSUMER_KEY")
+    # --- LinkedIn Logic ---
+    if platform == "linkedin":
+        client_key = os.getenv("LINKEDIN_CLIENT_ID")
+        if not client_key:
+             return HTMLResponse("Server Error: LINKEDIN_CLIENT_ID not set.", status_code=500)
+        
+        # Save who is trying to log in
+        request.session["connecting_client_id"] = client_id
+        
+        # Build the LinkedIn Login URL
+        # We need specific permissions: w_member_social (to post), openid (to know who they are)
+        base_url = str(request.base_url).rstrip("/")
+        callback_uri = f"{base_url}/auth/linkedin/callback"
+        
+        # Generate a random state string for security
+        state = hashlib.sha256(os.urandom(1024)).hexdigest()
+        request.session["oauth_state"] = state
+        
+        params = {
+            "response_type": "code",
+            "client_id": client_key,
+            "redirect_uri": callback_uri,
+            "state": state,
+            "scope": "openid profile email w_member_social"
+        }
+        from urllib.parse import urlencode
+        url = f"https://www.linkedin.com/oauth/v2/authorization?{urlencode(params)}"
+        return RedirectResponse(url)
+
+    # --- X (Twitter) Logic ---
+    if platform == "x":
+        # 1. Get Consumer Keys from Env
+        consumer_key = os.getenv("X_CONSUMER_KEY")
+        # ... (Keep the rest of your X logic exactly as it was, just indented)
+        consumer_secret = os.getenv("X_CONSUMER_SECRET")
+        if not consumer_key or not consumer_secret:
+             return HTMLResponse("Server Error: X_CONSUMER_KEY not set.", status_code=500)
+
+        try:
+            oauth = OAuth1Session(consumer_key, client_secret=consumer_secret)
+            base_url = str(request.base_url).rstrip("/")
+            callback_uri = f"{base_url}/auth/x/callback?origin_client_id={client_id}"
+            
+            fetch_response = oauth.fetch_request_token(f"https://api.twitter.com/oauth/request_token?oauth_callback={callback_uri}")
+            resource_owner_key = fetch_response.get("oauth_token")
+            resource_owner_secret = fetch_response.get("oauth_token_secret")
+            
+            oauth_tokens[resource_owner_key] = {
+                "secret": resource_owner_secret,
+                "client_id": client_id
+            }
+            
+            authorization_url = oauth.authorization_url("https://api.twitter.com/oauth/authorize")
+            return RedirectResponse(authorization_url)
+        except Exception as e:
+            logger.error("X Auth Start Failed: %s", e)
+            return HTMLResponse(f"Failed to start X login: {e}", status_code=500)
+
+    return HTMLResponse(f"Platform {platform} not supported", status_code=400)
     consumer_secret = os.getenv("X_CONSUMER_SECRET")
     
     if not consumer_key or not consumer_secret:
@@ -1625,6 +1679,76 @@ def auth_callback_x(
     except Exception as e:
         logger.exception("X Auth Callback Failed")
         return HTMLResponse(f"Error saving X token: {e}", status_code=500)
+
+@app.get("/auth/linkedin/callback")
+def auth_callback_linkedin(code: str, state: str, request: Request):
+    """
+    User is back from LinkedIn. Swap code for Access Token.
+    """
+    client_id = request.session.get("connecting_client_id")
+    saved_state = request.session.get("oauth_state")
+    
+    if not client_id or state != saved_state:
+        return HTMLResponse("Error: Session invalid or state mismatch. Try again.", status_code=400)
+
+    client_key = os.getenv("LINKEDIN_CLIENT_ID")
+    client_secret = os.getenv("LINKEDIN_CLIENT_SECRET")
+    
+    # 1. Swap Code for Token
+    base_url = str(request.base_url).rstrip("/")
+    redirect_uri = f"{base_url}/auth/linkedin/callback"
+    
+    token_url = "https://www.linkedin.com/oauth/v2/accessToken"
+    payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": client_key,
+        "client_secret": client_secret
+    }
+    
+    try:
+        resp = requests.post(token_url, data=payload)
+        data = resp.json()
+        
+        access_token = data.get("access_token")
+        if not access_token:
+             return HTMLResponse(f"LinkedIn Error: {data}", status_code=400)
+             
+        # 2. Save to Database
+        from main import get_main_engine
+        engine = get_main_engine()
+        with engine.begin() as conn:
+             # Read current attributes
+             row = conn.execute(
+                 text("SELECT attributes FROM clients WHERE id = :id"), 
+                 {"id": client_id}
+             ).fetchone()
+             
+             if not row: return HTMLResponse("Client not found.", status_code=404)
+             
+             import json
+             attrs = {}
+             if row[0]:
+                 try: attrs = json.loads(row[0])
+                 except: pass
+            
+             # Update LinkedIn Token
+             attrs["linkedin_access_token"] = access_token
+             # LinkedIn tokens expire in 60 days. Ideally, save 'expires_in' too.
+             
+             conn.execute(
+                 text("UPDATE clients SET attributes = :attr WHERE id = :id"),
+                 {"id": client_id, "attr": json.dumps(attrs)}
+             )
+        
+        # 3. Redirect to Settings
+        frontend_url = "https://postify.co.za" 
+        return RedirectResponse(f"{frontend_url}/clients/{client_id}/settings")
+        
+    except Exception as e:
+        logger.exception("LinkedIn Callback Failed")
+        return HTMLResponse(f"Error: {e}", status_code=500)
 
 
 if __name__ == "__main__":
