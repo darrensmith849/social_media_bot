@@ -270,7 +270,6 @@ post_templates:
 # Data model
 # ------------------
 @dataclass
-@dataclass
 class Client:
     id: str
     name: str
@@ -856,7 +855,7 @@ class XPublisher(Publisher):
         self.consumer_key = os.getenv("X_CONSUMER_KEY") # The App Key is global (Yours)
         self.consumer_secret = os.getenv("X_CONSUMER_SECRET") # The App Secret is global (Yours)
         
-        # These are specific to the CLIENT (Joe's Tokens)
+        # These are specific to the CLIENT
         self.access_token = client_config.get("x_access_token")
         self.access_token_secret = client_config.get("x_access_token_secret")
 
@@ -890,14 +889,45 @@ class XPublisher(Publisher):
             logger.error("X Exception: %s", e)
             return PublishResult({"platform": self.platform, "id": None, "text": text, "error": str(e)})
 
+class FacebookPublisher(Publisher):
+    platform = "facebook"
+    def __init__(self, client_config: Dict[str, Any]):
+        self.page_id = client_config.get("facebook_page_id")
+        self.access_token = client_config.get("facebook_page_token")
+
+    def publish(self, text: str, media_url: Optional[str] = None) -> PublishResult:
+        if DRY_RUN or not (self.page_id and self.access_token):
+            logger.info("[DRY] facebook | %s", text)
+            return PublishResult({"platform": self.platform, "id": None, "text": text})
+
+        try:
+            url = f"https://graph.facebook.com/v18.0/{self.page_id}/feed"
+            payload = {"message": text, "access_token": self.access_token}
+            
+            resp = requests.post(url, data=payload)
+            if resp.status_code != 200:
+                return PublishResult({"platform": self.platform, "id": None, "text": text, "error": resp.text})
+            
+            data = resp.json()
+            return PublishResult({"platform": self.platform, "id": data.get("id"), "text": text})
+        except Exception as e:
+            logger.error("Facebook Post Failed: %s", e)
+            return PublishResult({"platform": self.platform, "id": None, "text": text, "error": str(e)})
+
+
 def build_publishers(client: Client) -> list[Publisher]:
     pubs = [ConsolePublisher()]
     
-    # Check if X is enabled globally AND if the client has tokens
-    if ENABLE_X:
-        # Pass the client's attributes to the publisher
-        pubs.append(XPublisher(client.attributes))
+    attrs = client.attributes or {}
+    
+    # X (Twitter)
+    if ENABLE_X and attrs.get("x_access_token"):
+        pubs.append(XPublisher(attrs))
         
+    # Facebook
+    if attrs.get("facebook_page_token"):
+        pubs.append(FacebookPublisher(attrs))
+
     return pubs
 
 # ------------------
@@ -1511,15 +1541,10 @@ def auth_login(platform: str, client_id: str, request: Request):
         if not client_key:
              return HTMLResponse("Server Error: LINKEDIN_CLIENT_ID not set.", status_code=500)
         
-        # Save who is trying to log in
         request.session["connecting_client_id"] = client_id
-        
-        # Build the LinkedIn Login URL
-        # We need specific permissions: w_member_social (to post), openid (to know who they are)
         base_url = str(request.base_url).rstrip("/")
         callback_uri = f"{base_url}/auth/linkedin/callback"
         
-        # Generate a random state string for security
         state = hashlib.sha256(os.urandom(1024)).hexdigest()
         request.session["oauth_state"] = state
         
@@ -1530,15 +1555,33 @@ def auth_login(platform: str, client_id: str, request: Request):
             "state": state,
             "scope": "openid profile email w_member_social"
         }
-        from urllib.parse import urlencode
         url = f"https://www.linkedin.com/oauth/v2/authorization?{urlencode(params)}"
+        return RedirectResponse(url)
+
+    # --- Facebook Logic ---
+    if platform == "facebook":
+        app_id = os.getenv("FACEBOOK_APP_ID")
+        if not app_id:
+             return HTMLResponse("Server Error: FACEBOOK_APP_ID not set.", status_code=500)
+        
+        request.session["connecting_client_id"] = client_id
+        base_url = str(request.base_url).rstrip("/")
+        callback_uri = f"{base_url}/auth/facebook/callback"
+        
+        state = hashlib.sha256(os.urandom(1024)).hexdigest()
+        request.session["oauth_state"] = state
+        
+        scope = "pages_manage_posts,pages_read_engagement,public_profile"
+        
+        url = (
+            f"https://www.facebook.com/v18.0/dialog/oauth?"
+            f"client_id={app_id}&redirect_uri={callback_uri}&state={state}&scope={scope}"
+        )
         return RedirectResponse(url)
 
     # --- X (Twitter) Logic ---
     if platform == "x":
-        # 1. Get Consumer Keys from Env
         consumer_key = os.getenv("X_CONSUMER_KEY")
-        # ... (Keep the rest of your X logic exactly as it was, just indented)
         consumer_secret = os.getenv("X_CONSUMER_SECRET")
         if not consumer_key or not consumer_secret:
              return HTMLResponse("Server Error: X_CONSUMER_KEY not set.", status_code=500)
@@ -1564,37 +1607,6 @@ def auth_login(platform: str, client_id: str, request: Request):
             return HTMLResponse(f"Failed to start X login: {e}", status_code=500)
 
     return HTMLResponse(f"Platform {platform} not supported", status_code=400)
-    consumer_secret = os.getenv("X_CONSUMER_SECRET")
-    
-    if not consumer_key or not consumer_secret:
-        return HTMLResponse("Server Error: X_CONSUMER_KEY not set.", status_code=500)
-
-    # 2. Get a "Request Token" from Twitter
-    try:
-        oauth = OAuth1Session(consumer_key, client_secret=consumer_secret)
-        # This callback URL must match exactly what you set in Twitter Dev Portal!
-        # It usually looks like: https://your-app.railway.app/auth/x/callback
-        # We append client_id to the callback so we know who it is when they return
-        base_url = str(request.base_url).rstrip("/")
-        callback_uri = f"{base_url}/auth/x/callback?origin_client_id={client_id}"
-        
-        fetch_response = oauth.fetch_request_token(f"https://api.twitter.com/oauth/request_token?oauth_callback={callback_uri}")
-        resource_owner_key = fetch_response.get("oauth_token")
-        resource_owner_secret = fetch_response.get("oauth_token_secret")
-        
-        # Save these temporary secrets so we can verify the user when they return
-        oauth_tokens[resource_owner_key] = {
-            "secret": resource_owner_secret,
-            "client_id": client_id
-        }
-        
-        # 3. Redirect user to Twitter to approve
-        authorization_url = oauth.authorization_url("https://api.twitter.com/oauth/authorize")
-        return RedirectResponse(authorization_url)
-        
-    except Exception as e:
-        logger.error("X Auth Start Failed: %s", e)
-        return HTMLResponse(f"Failed to start X login: {e}", status_code=500)
 
 
 @app.get("/auth/x/callback")
@@ -1639,13 +1651,9 @@ def auth_callback_x(
         final_secret = tokens.get("oauth_token_secret")
         
         # 3. Save to Database (Merge into attributes)
-        # We need to fetch current attributes, merge, and save.
-        with STATE_ENGINE.begin() as conn: # Or MAIN_ENGINE if you are using MySQL strictly
-             # NOTE: We use get_main_engine() to write to the main MySQL DB
-             from main import get_main_engine
-             engine = get_main_engine()
-             
-             # Read current
+        # Use get_main_engine() to ensure we write to the correct MySQL DB
+        eng = get_main_engine()
+        with eng.begin() as conn:
              row = conn.execute(
                  text("SELECT attributes FROM clients WHERE id = :id"), 
                  {"id": client_id}
@@ -1654,7 +1662,6 @@ def auth_callback_x(
              if not row:
                  return HTMLResponse("Client not found in DB.", status_code=404)
              
-             import json
              attrs = {}
              if row[0]:
                  try: attrs = json.loads(row[0])
@@ -1671,8 +1678,6 @@ def auth_callback_x(
              )
 
         # 4. Success Page
-        # We redirect back to the frontend settings page
-        # Note: In production, hardcode your frontend URL or use an env var
         frontend_url = "https://postify.co.za" 
         return RedirectResponse(f"{frontend_url}/clients/{client_id}/settings")
 
@@ -1682,19 +1687,15 @@ def auth_callback_x(
 
 @app.get("/auth/linkedin/callback")
 def auth_callback_linkedin(code: str, state: str, request: Request):
-    """
-    User is back from LinkedIn. Swap code for Access Token.
-    """
     client_id = request.session.get("connecting_client_id")
     saved_state = request.session.get("oauth_state")
     
     if not client_id or state != saved_state:
-        return HTMLResponse("Error: Session invalid or state mismatch. Try again.", status_code=400)
+        return HTMLResponse("Error: Session invalid or state mismatch.", status_code=400)
 
     client_key = os.getenv("LINKEDIN_CLIENT_ID")
     client_secret = os.getenv("LINKEDIN_CLIENT_SECRET")
     
-    # 1. Swap Code for Token
     base_url = str(request.base_url).rstrip("/")
     redirect_uri = f"{base_url}/auth/linkedin/callback"
     
@@ -1715,11 +1716,8 @@ def auth_callback_linkedin(code: str, state: str, request: Request):
         if not access_token:
              return HTMLResponse(f"LinkedIn Error: {data}", status_code=400)
              
-        # 2. Save to Database
-        from main import get_main_engine
-        engine = get_main_engine()
-        with engine.begin() as conn:
-             # Read current attributes
+        eng = get_main_engine()
+        with eng.begin() as conn:
              row = conn.execute(
                  text("SELECT attributes FROM clients WHERE id = :id"), 
                  {"id": client_id}
@@ -1727,28 +1725,85 @@ def auth_callback_linkedin(code: str, state: str, request: Request):
              
              if not row: return HTMLResponse("Client not found.", status_code=404)
              
-             import json
              attrs = {}
              if row[0]:
                  try: attrs = json.loads(row[0])
                  except: pass
             
-             # Update LinkedIn Token
              attrs["linkedin_access_token"] = access_token
-             # LinkedIn tokens expire in 60 days. Ideally, save 'expires_in' too.
-             
              conn.execute(
                  text("UPDATE clients SET attributes = :attr WHERE id = :id"),
                  {"id": client_id, "attr": json.dumps(attrs)}
              )
         
-        # 3. Redirect to Settings
         frontend_url = "https://postify.co.za" 
         return RedirectResponse(f"{frontend_url}/clients/{client_id}/settings")
         
     except Exception as e:
         logger.exception("LinkedIn Callback Failed")
         return HTMLResponse(f"Error: {e}", status_code=500)
+
+
+@app.get("/auth/facebook/callback")
+def auth_callback_facebook(code: str, state: str, request: Request):
+    client_id = request.session.get("connecting_client_id")
+    saved_state = request.session.get("oauth_state")
+    
+    if not client_id or state != saved_state:
+        return HTMLResponse("Error: Session invalid or state mismatch.", status_code=400)
+
+    app_id = os.getenv("FACEBOOK_APP_ID")
+    app_secret = os.getenv("FACEBOOK_APP_SECRET")
+    base_url = str(request.base_url).rstrip("/")
+    redirect_uri = f"{base_url}/auth/facebook/callback"
+
+    # 1. Exchange Code for Short-Lived User Token
+    token_url = (
+        f"https://graph.facebook.com/v18.0/oauth/access_token?"
+        f"client_id={app_id}&redirect_uri={redirect_uri}&client_secret={app_secret}&code={code}"
+    )
+    resp = requests.get(token_url)
+    data = resp.json()
+    short_token = data.get("access_token")
+    if not short_token:
+        return HTMLResponse(f"Facebook Token Error: {data}", status_code=400)
+
+    # 2. Exchange for Long-Lived User Token
+    long_url = (
+        f"https://graph.facebook.com/v18.0/oauth/access_token?"
+        f"grant_type=fb_exchange_token&client_id={app_id}&client_secret={app_secret}&fb_exchange_token={short_token}"
+    )
+    long_resp = requests.get(long_url)
+    long_data = long_resp.json()
+    user_token = long_data.get("access_token", short_token)
+
+    # 3. Fetch List of Pages this user manages
+    pages_url = f"https://graph.facebook.com/v18.0/me/accounts?access_token={user_token}"
+    pages_resp = requests.get(pages_url)
+    pages_data = pages_resp.json().get("data", [])
+
+    # 4. Save User Token + Page Candidates to DB
+    eng = get_main_engine()
+    with eng.begin() as conn:
+         row = conn.execute(text("SELECT attributes FROM clients WHERE id = :id"), {"id": client_id}).fetchone()
+         attrs = {}
+         if row and row[0]:
+             try: attrs = json.loads(row[0])
+             except: pass
+         
+         attrs["facebook_candidates"] = [
+             {"name": p["name"], "id": p["id"], "access_token": p["access_token"]} 
+             for p in pages_data
+         ]
+         attrs["facebook_user_token"] = user_token
+         
+         conn.execute(
+             text("UPDATE clients SET attributes = :attr WHERE id = :id"),
+             {"id": client_id, "attr": json.dumps(attrs)}
+         )
+
+    frontend_url = "https://postify.co.za"
+    return RedirectResponse(f"{frontend_url}/clients/{client_id}/settings")
 
 
 if __name__ == "__main__":
