@@ -1499,41 +1499,132 @@ async def telegram_webhook(update: Dict[str, Any]):
 # OAuth / Connect Routes
 # ------------------
 
+# In-memory store for request tokens (step 1 of OAuth 1.0a)
+# In production, use Redis. For a single-instance bot, a dict is fine.
+oauth_tokens = {} 
+
 @app.get("/auth/{platform}/login")
 def auth_login(platform: str, client_id: str, request: Request):
-    """
-    Step 1: The Frontend 'Connect' button sends the user here.
-    We save the 'client_id' in a cookie/session so we know who is connecting
-    when they come back from Facebook/LinkedIn.
-    """
-    if platform not in ["facebook", "linkedin", "x"]:
-        raise HTTPException(status_code=400, detail="Unsupported platform")
+    if platform != "x":
+        return HTMLResponse("Only X (Twitter) is supported in this version.", status_code=400)
     
-    # Save the client_id in the session
-    request.session["connecting_client_id"] = client_id
+    # 1. Get Consumer Keys from Env
+    consumer_key = os.getenv("X_CONSUMER_KEY")
+    consumer_secret = os.getenv("X_CONSUMER_SECRET")
     
-    # TODO: Generate the real Redirect URL for the specific platform
-    # For now, we return a dummy URL to prove the route works
-    return {"url": f"https://example.com/mock-login/{platform}?client_id={client_id}"}
+    if not consumer_key or not consumer_secret:
+        return HTMLResponse("Server Error: X_CONSUMER_KEY not set.", status_code=500)
+
+    # 2. Get a "Request Token" from Twitter
+    try:
+        oauth = OAuth1Session(consumer_key, client_secret=consumer_secret)
+        # This callback URL must match exactly what you set in Twitter Dev Portal!
+        # It usually looks like: https://your-app.railway.app/auth/x/callback
+        # We append client_id to the callback so we know who it is when they return
+        base_url = str(request.base_url).rstrip("/")
+        callback_uri = f"{base_url}/auth/x/callback?origin_client_id={client_id}"
+        
+        fetch_response = oauth.fetch_request_token(f"https://api.twitter.com/oauth/request_token?oauth_callback={callback_uri}")
+        resource_owner_key = fetch_response.get("oauth_token")
+        resource_owner_secret = fetch_response.get("oauth_token_secret")
+        
+        # Save these temporary secrets so we can verify the user when they return
+        oauth_tokens[resource_owner_key] = {
+            "secret": resource_owner_secret,
+            "client_id": client_id
+        }
+        
+        # 3. Redirect user to Twitter to approve
+        authorization_url = oauth.authorization_url("https://api.twitter.com/oauth/authorize")
+        return RedirectResponse(authorization_url)
+        
+    except Exception as e:
+        logger.error("X Auth Start Failed: %s", e)
+        return HTMLResponse(f"Failed to start X login: {e}", status_code=500)
 
 
-@app.get("/auth/{platform}/callback")
-def auth_callback(platform: str, code: str, state: Optional[str] = None, request: Request = None):
+@app.get("/auth/x/callback")
+def auth_callback_x(
+    oauth_token: str, 
+    oauth_verifier: str, 
+    origin_client_id: str, 
+    request: Request
+):
     """
-    Step 2: The Platform sends the user back here with a 'code'.
-    We swap that code for a permanent Token.
+    User is back from Twitter. We swap the temp token for a permanent one.
     """
-    client_id = request.session.get("connecting_client_id")
-    if not client_id:
-        return HTMLResponse("Error: Session lost. Please try again.", status_code=400)
+    # 1. Retrieve the temp secret we saved earlier
+    temp_data = oauth_tokens.get(oauth_token)
+    if not temp_data:
+        return HTMLResponse("Error: Session expired or invalid token. Try again.", status_code=400)
     
-    logger.info(f"Received callback for {platform} (Client: {client_id}) Code: {code}")
+    del oauth_tokens[oauth_token] # Clean up
+    
+    resource_owner_secret = temp_data["secret"]
+    client_id = temp_data["client_id"]
+    
+    # Double check client_id matches (security)
+    if client_id != origin_client_id:
+        return HTMLResponse("Error: Client ID mismatch.", status_code=400)
 
-    # TODO: 
-    # 1. Swap 'code' for 'access_token' using the platform's API
-    # 2. Save 'access_token' into the DB for this client_id
-    
-    return HTMLResponse(f"<h1>Success!</h1><p>Connected {platform} for client {client_id}. You can close this window.</p>")
+    consumer_key = os.getenv("X_CONSUMER_KEY")
+    consumer_secret = os.getenv("X_CONSUMER_SECRET")
+
+    # 2. Swap for Permanent Access Token
+    try:
+        oauth = OAuth1Session(
+            consumer_key,
+            client_secret=consumer_secret,
+            resource_owner_key=oauth_token,
+            resource_owner_secret=resource_owner_secret,
+            verifier=oauth_verifier,
+        )
+        tokens = oauth.fetch_access_token("https://api.twitter.com/oauth/access_token")
+        
+        final_key = tokens.get("oauth_token")
+        final_secret = tokens.get("oauth_token_secret")
+        
+        # 3. Save to Database (Merge into attributes)
+        # We need to fetch current attributes, merge, and save.
+        with STATE_ENGINE.begin() as conn: # Or MAIN_ENGINE if you are using MySQL strictly
+             # NOTE: We use get_main_engine() to write to the main MySQL DB
+             from main import get_main_engine
+             engine = get_main_engine()
+             
+             # Read current
+             row = conn.execute(
+                 text("SELECT attributes FROM clients WHERE id = :id"), 
+                 {"id": client_id}
+             ).fetchone()
+             
+             if not row:
+                 return HTMLResponse("Client not found in DB.", status_code=404)
+             
+             import json
+             attrs = {}
+             if row[0]:
+                 try: attrs = json.loads(row[0])
+                 except: pass
+            
+             # Update
+             attrs["x_access_token"] = final_key
+             attrs["x_access_token_secret"] = final_secret
+             
+             # Write back
+             conn.execute(
+                 text("UPDATE clients SET attributes = :attr WHERE id = :id"),
+                 {"id": client_id, "attr": json.dumps(attrs)}
+             )
+
+        # 4. Success Page
+        # We redirect back to the frontend settings page
+        # Note: In production, hardcode your frontend URL or use an env var
+        frontend_url = "https://postify.co.za" 
+        return RedirectResponse(f"{frontend_url}/clients/{client_id}/settings")
+
+    except Exception as e:
+        logger.exception("X Auth Callback Failed")
+        return HTMLResponse(f"Error saving X token: {e}", status_code=500)
 
 
 if __name__ == "__main__":
