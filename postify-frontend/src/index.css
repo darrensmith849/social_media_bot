@@ -1,0 +1,185 @@
+:root {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #0f172a;
+  background-color: #f8fafc;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.app-root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-header {
+  height: 56px;
+  padding: 0 1.5rem;
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background-color: #ffffff;
+}
+
+.app-header-left {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+}
+
+.app-logo {
+  font-weight: 700;
+  font-size: 1.1rem;
+  text-decoration: none;
+  color: #0f172a;
+}
+
+.app-nav {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.app-nav-link {
+  text-decoration: none;
+  font-size: 0.9rem;
+  color: #64748b;
+}
+
+.app-nav-link.active {
+  color: #0f172a;
+  font-weight: 600;
+}
+
+.app-header-right {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.app-badge {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+.app-main {
+  flex: 1;
+  max-width: 960px;
+  width: 100%;
+  margin: 1.5rem auto;
+  padding: 0 1.5rem 2rem;
+}
+
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.page-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.muted {
+  color: #64748b;
+  font-size: 0.9rem;
+}
+
+.error-text {
+  color: #b91c1c;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1rem;
+}
+
+.card-column {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.card {
+  background: #ffffff;
+  border-radius: 0.75rem;
+  border: 1px solid #e2e8f0;
+  padding: 1rem 1.2rem;
+}
+
+.card-clickable {
+  cursor: pointer;
+  transition: box-shadow 0.12s ease, transform 0.12s ease;
+}
+
+.card-clickable:hover {
+  box-shadow: 0 8px 16px rgba(15, 23, 42, 0.05);
+  transform: translateY(-1px);
+}
+
+.pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.5rem;
+}
+
+.pill {
+  font-size: 0.75rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  background: #e2e8f0;
+}
+
+.pill-soft {
+  background: #f1f5f9;
+}
+
+.btn {
+  border-radius: 999px;
+  border: 1px solid #cbd5f5;
+  padding: 0.35rem 0.9rem;
+  background: #ffffff;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.btn.primary {
+  background: #0f172a;
+  color: #ffffff;
+  border-color: #0f172a;
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.post-body {
+  white-space: pre-wrap;
+  margin-top: 0.5rem;
+}
+
+a {
+  color: inherit;
+}
+a:hover {
+  text-decoration: none;
+}
