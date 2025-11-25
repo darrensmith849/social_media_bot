@@ -39,6 +39,7 @@ from typing import List, Optional, Dict, Any, Tuple, Callable
 
 import yaml
 import requests
+from requests_oauthlib import OAuth1Session
 from jinja2 import Environment, BaseLoader, StrictUndefined
 
 from fastapi import FastAPI, Query, Body, HTTPException
