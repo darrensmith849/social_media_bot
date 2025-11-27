@@ -1897,26 +1897,47 @@ def api_reject_candidate(candidate_id: int, payload: Dict[str, Any] = Body(...))
 
 @app.post("/api/clients/{client_id}/generate")
 def api_generate_post(client_id: str):
-    """Manually trigger the bot to write a draft post for this client."""
+    """Manually trigger the bot to write a draft post, with data validation."""
     # 1. Fetch Client
     clients = fetch_clients()
     client = next((c for c in clients if c.id == client_id), None)
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
+    # 2. Pre-flight Data Check
+    # We require specific attributes to be present for the templates to work.
+    missing_fields = []
+    attrs = client.attributes or {}
+    
+    # Check for core Brand DNA elements
+    if not attrs.get("tips"): missing_fields.append("Tips")
+    if not attrs.get("myths"): missing_fields.append("Myths")
+    if not attrs.get("tone"): missing_fields.append("Tone of Voice")
+    
+    # Check for content atoms (often used in 'Soft Sell' or 'Educational' templates)
+    if not attrs.get("content_atoms"): missing_fields.append("Content Atoms (Mission, FAQs, etc.)")
+    
+    if missing_fields:
+        # Return 200 but with ok=False so frontend handles it gracefully
+        return {
+            "ok": False, 
+            "error": "Missing required Brand DNA data.", 
+            "missing": missing_fields
+        }
+
     try:
-        # 2. Generate Draft using local helpers (No external imports needed)
-        # Load templates and pick one based on the 4-1-1 rule
+        # 3. Generate Draft
         templates = load_templates()
+        # Ensure we use the relaxed env builder if possible, but the check above is the main guard
+        env = build_env() 
+        
         count = monthly_count(client.id, datetime.now(TZ))
         tpl = select_template(templates, client, count)
         
-        # Render the text
         text_body = render_text(tpl["text"], client)
         media_url = client.attributes.get("hero_image_url") or FALLBACK_IMAGE_URL
         platforms = tpl.get("platforms", [])
         
-        # 3. Save directly to DB as PENDING
         create_post_candidate(
             client_id=client.id,
             template_key=tpl["key"],

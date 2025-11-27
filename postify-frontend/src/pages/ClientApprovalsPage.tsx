@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useNavigate } from "react-router-dom";
 import {
   type PostCandidate,
   fetchClient,
@@ -7,11 +7,12 @@ import {
   approveCandidate,
   rejectCandidate,
   type ClientSummary,
-  generatePost,
+  API_BASE_URL,
 } from "../services/api";
 
 export const ClientApprovalsPage = () => {
   const { clientId } = useParams<{ clientId: string }>();
+  const navigate = useNavigate();
   const [client, setClient] = useState<ClientSummary | null>(null);
   const [candidates, setCandidates] = useState<PostCandidate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -75,10 +76,33 @@ export const ClientApprovalsPage = () => {
   const handleGenerate = async () => {
     setLoading(true);
     try {
-      await generatePost(clientId!);
-      setTimeout(() => window.location.reload(), 1000); // Reload to see the new post
+      // Direct fetch to handle custom non-200 responses if needed, or check the JSON body
+      const response = await fetch(`${API_BASE_URL}/api/clients/${clientId}/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server error: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      if (data.ok === false && data.missing) {
+        const msg = `⚠️ Cannot generate post yet!\n\nThe following Brand DNA is missing:\n- ${data.missing.join("\n- ")}\n\nClick OK to go to Settings and add them.`;
+        if (window.confirm(msg)) {
+          navigate(`/clients/${clientId}/settings`);
+        }
+      } else if (data.ok) {
+        // Success - reload to see the new post
+        setTimeout(() => window.location.reload(), 1000);
+      } else {
+        alert("Failed: " + (data.detail || "Unknown error"));
+      }
+
     } catch (err: any) {
       alert("Failed to generate: " + err.message);
+    } finally {
       setLoading(false);
     }
   };
