@@ -1544,7 +1544,46 @@ oauth_tokens = {}
 
 @app.get("/auth/{platform}/login")
 def auth_login(platform: str, client_id: str, request: Request):
-    # --- LinkedIn Logic ---
+    # --- 1. DRY RUN / MOCK MODE ---
+    if DRY_RUN:
+        logger.info(f"DRY RUN: Mocking login for {platform} client {client_id}")
+        
+        # Fake tokens
+        fake_update = {}
+        if platform == "x":
+            fake_update = {"x_access_token": "dry_run_fake_token"}
+        elif platform == "linkedin":
+            fake_update = {"linkedin_access_token": "dry_run_fake_token"}
+        elif platform == "facebook":
+            fake_update = {
+                "facebook_page_token": "dry_run_fake_token",
+                "facebook_page_name": "Dry Run Page",
+                "facebook_page_id": "dry_run_123"
+            }
+        
+        # Save fake tokens directly to DB
+        eng = get_main_engine()
+        with eng.begin() as conn:
+             row = conn.execute(text("SELECT attributes FROM clients WHERE id = :id"), {"id": client_id}).fetchone()
+             if not row: return HTMLResponse("Client not found", status_code=404)
+             
+             attrs = {}
+             if row[0]:
+                 try: attrs = json.loads(row[0])
+                 except: pass
+            
+             attrs.update(fake_update)
+             
+             conn.execute(
+                 text("UPDATE clients SET attributes = :attr WHERE id = :id"),
+                 {"id": client_id, "attr": json.dumps(attrs)}
+             )
+        
+        # Redirect back to settings immediately
+        frontend_url = "https://postify.co.za" 
+        return RedirectResponse(f"{frontend_url}/clients/{client_id}/settings")
+
+    # --- 2. REAL OAUTH LOGIC (Existing code below) ---
     if platform == "linkedin":
         client_key = os.getenv("LINKEDIN_CLIENT_ID")
         if not client_key:
@@ -1564,10 +1603,10 @@ def auth_login(platform: str, client_id: str, request: Request):
             "state": state,
             "scope": "openid profile email w_member_social"
         }
+        from urllib.parse import urlencode
         url = f"https://www.linkedin.com/oauth/v2/authorization?{urlencode(params)}"
         return RedirectResponse(url)
 
-    # --- Facebook Logic ---
     if platform == "facebook":
         app_id = os.getenv("FACEBOOK_APP_ID")
         if not app_id:
@@ -1588,7 +1627,6 @@ def auth_login(platform: str, client_id: str, request: Request):
         )
         return RedirectResponse(url)
 
-    # --- X (Twitter) Logic ---
     if platform == "x":
         consumer_key = os.getenv("X_CONSUMER_KEY")
         consumer_secret = os.getenv("X_CONSUMER_SECRET")
