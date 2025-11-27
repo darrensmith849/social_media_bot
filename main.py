@@ -1486,43 +1486,53 @@ def get_rejection_patterns(
 @app.post("/api/clients/{client_id}/attributes/merge")
 def merge_client_attributes(client_id: str, overrides: Dict[str, Any] = Body(...)):
     """
-    Merge manually-uploaded attributes into the client's attributes JSON.
-
-    - If a key exists in overrides, it overwrites the scraped value.
-    - If a key is omitted in overrides, the scraped value is preserved.
-
-    This is the backend hook for your 'upload section'.
+    Merge manual attributes (Brand DNA) into the existing JSON.
+    Includes robust type checking and error logging.
     """
     try:
+        # 1. Get DB Engine
         eng = get_main_engine()
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        
+        with eng.begin() as conn:
+            # 2. Fetch existing attributes
+            row = conn.execute(
+                text("SELECT attributes FROM clients WHERE id = :id"),
+                {"id": client_id}
+            ).fetchone()
 
-    with eng.begin() as conn:
-        row = conn.execute(
-            text("SELECT attributes FROM clients WHERE id = :id"),
-            {"id": client_id},
-        ).first()
+            if not row:
+                raise HTTPException(status_code=404, detail="Client not found")
 
-        if not row:
-            raise HTTPException(status_code=404, detail="Client not found")
+            # 3. Safely Load Current Attributes
+            # Depending on the DB driver, this could be a Dict, a JSON String, or None.
+            current_raw = row[0]
+            current_attrs = {}
+            
+            if isinstance(current_raw, dict):
+                current_attrs = current_raw
+            elif isinstance(current_raw, str):
+                try:
+                    current_attrs = json.loads(current_raw)
+                except Exception:
+                    logger.warning(f"Could not parse attributes JSON for client {client_id}")
+                    current_attrs = {}
+            
+            # 4. Perform the Merge
+            # This combines the old data with the new form data
+            merged = {**current_attrs, **overrides}
+            
+            # 5. Save back to DB
+            # We use json.dumps() to ensure compatibility with all SQL drivers
+            conn.execute(
+                text("UPDATE clients SET attributes = :attr WHERE id = :id"),
+                {"id": client_id, "attr": json.dumps(merged)}
+            )
 
-        current_attrs = row[0] or {}
-        if isinstance(current_attrs, str):
-            try:
-                current_attrs = json.loads(current_attrs) or {}
-            except Exception:
-                current_attrs = {}
+        return {"ok": True, "client_id": client_id}
 
-        # Manual upload always wins on conflict
-        merged = {**current_attrs, **overrides}
-
-        conn.execute(
-            text("UPDATE clients SET attributes = :attr WHERE id = :id"),
-            {"id": client_id, "attr": json.dumps(merged)},
-        )
-
-    return {"ok": True, "client_id": client_id}
+    except Exception as e:
+        logger.exception("Brand DNA Save Failed") # This will show in Railway logs
+        raise HTTPException(status_code=500, detail=f"Save Failed: {str(e)}")
 
 
 @app.post("/telegram/webhook")
