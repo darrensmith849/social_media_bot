@@ -1894,6 +1894,37 @@ def api_reject_candidate(candidate_id: int, payload: Dict[str, Any] = Body(...))
     update_post_candidate_status(candidate_id, "REJECTED", rejection_reason=reason)
     return {"ok": True}
 
+
+@app.post("/api/clients/{client_id}/generate")
+def api_generate_post(client_id: str):
+    """Manually trigger the bot to write a draft post for this client."""
+    # 1. Fetch Client
+    clients = fetch_clients()
+    client = next((c for c in clients if c.id == client_id), None)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    # 2. Force 'Approval Mode' so it doesn't auto-publish
+    client.attributes["approval_mode"] = "always"
+
+    # 3. Import and Run Generator
+    try:
+        from telegram_approval import handle_scheduled_post
+        import main
+        # Force global toggle ON temporarily so it behaves like a draft
+        original_setting = main.TELEGRAM_APPROVAL_ENABLED
+        main.TELEGRAM_APPROVAL_ENABLED = True 
+        
+        handle_scheduled_post(client, record_state=True)
+        
+        # Restore setting
+        main.TELEGRAM_APPROVAL_ENABLED = original_setting
+        
+        return {"ok": True, "message": "Draft generated!"}
+    except Exception as e:
+        logger.exception("Manual generation failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

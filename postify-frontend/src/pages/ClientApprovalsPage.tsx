@@ -7,6 +7,7 @@ import {
   approveCandidate,
   rejectCandidate,
   type ClientSummary,
+  generatePost,
 } from "../services/api";
 
 export const ClientApprovalsPage = () => {
@@ -71,6 +72,17 @@ export const ClientApprovalsPage = () => {
     }
   };
 
+  const handleGenerate = async () => {
+    setLoading(true);
+    try {
+      await generatePost(clientId!);
+      setTimeout(() => window.location.reload(), 1000); // Reload to see the new post
+    } catch (err: any) {
+      alert("Failed to generate: " + err.message);
+      setLoading(false);
+    }
+  };
+
   if (loading) return <p>Loading approvals…</p>;
   if (error) return <p className="error-text">{error}</p>;
   if (!client) return <p>Client not found.</p>;
@@ -85,6 +97,9 @@ export const ClientApprovalsPage = () => {
           </p>
         </div>
         <div className="page-header-actions">
+          <button className="btn primary" onClick={handleGenerate} disabled={loading} style={{ marginRight: "8px" }}>
+            ✨ Generate Draft
+          </button>
           <Link to={`/clients/${client.id}`} className="btn">
             Back to overview
           </Link>

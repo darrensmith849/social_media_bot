@@ -77,3 +77,7 @@ export async function rejectCandidate(
 ): Promise<void> {
   await api.post(`/api/candidates/${id}/reject`, { reason });
 }
+
+export async function generatePost(clientId: string): Promise<void> {
+  await api.post(`/api/clients/${clientId}/generate`);
+}
