@@ -1815,6 +1815,85 @@ def auth_callback_facebook(code: str, state: str, request: Request):
     return RedirectResponse(f"{frontend_url}/clients/{client_id}/settings")
 
 
+
+# ------------------
+# API Endpoints (The Bridge)
+# ------------------
+
+@app.get("/api/clients")
+def api_list_clients():
+    """Return a list of all clients for the dashboard."""
+    clients = fetch_clients()
+    # Convert to simple dicts
+    return {"clients": [
+        {
+            "id": c.id, 
+            "name": c.name, 
+            "industry": c.industry, 
+            "city": c.city, 
+            "attributes": c.attributes
+        } 
+        for c in clients
+    ]}
+
+@app.get("/api/clients/{client_id}")
+def api_get_client(client_id: str):
+    """Return a single client's details."""
+    clients = fetch_clients()
+    client = next((c for c in clients if c.id == client_id), None)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return {
+        "id": client.id, 
+        "name": client.name, 
+        "industry": client.industry, 
+        "city": client.city, 
+        "attributes": client.attributes
+    }
+
+@app.get("/api/clients/{client_id}/candidates")
+def api_list_candidates(client_id: str, status: str = "PENDING"):
+    """Return pending posts for approval."""
+    with STATE_ENGINE.begin() as conn:
+        rows = conn.execute(
+            text("SELECT * FROM post_candidates WHERE client_id=:cid AND status=:st ORDER BY slot_time ASC"),
+            {"cid": client_id, "st": status}
+        ).mappings().all()
+    
+    return {"candidates": [dict(r) for r in rows]}
+
+@app.post("/api/candidates/{candidate_id}/approve")
+def api_approve_candidate(candidate_id: int):
+    """Approve a post and publish it immediately."""
+    candidate = get_post_candidate(candidate_id)
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+        
+    client = next((c for c in fetch_clients() if c.id == candidate["client_id"]), None)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    # Publish
+    publish_text_for_client(
+        client, 
+        candidate["text_body"], 
+        candidate["media_url"], 
+        candidate["template_key"], 
+        candidate["platforms"], 
+        record_state=True
+    )
+    
+    # Update Status
+    update_post_candidate_status(candidate_id, "APPROVED")
+    return {"ok": True}
+
+@app.post("/api/candidates/{candidate_id}/reject")
+def api_reject_candidate(candidate_id: int, payload: Dict[str, Any] = Body(...)):
+    """Reject a post."""
+    reason = payload.get("reason")
+    update_post_candidate_status(candidate_id, "REJECTED", rejection_reason=reason)
+    return {"ok": True}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
