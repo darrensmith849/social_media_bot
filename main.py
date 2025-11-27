@@ -1483,7 +1483,7 @@ def get_rejection_patterns(
 
 
 
-@app.post("/clients/{client_id}/attributes/merge")
+@app.post("/api/clients/{client_id}/attributes/merge")
 def merge_client_attributes(client_id: str, overrides: Dict[str, Any] = Body(...)):
     """
     Merge manually-uploaded attributes into the client's attributes JSON.
