@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
-import { ClientSummary, fetchClient, API_BASE_URL } from "../services/api";
+import { fetchClient, API_BASE_URL } from "../services/api";
+import type { ClientSummary } from "../services/api";
 import axios from "axios";
 
 export const ClientSettingsPage = () => {
