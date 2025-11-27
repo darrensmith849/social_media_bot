@@ -1,43 +1,59 @@
 import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
-import { type ClientSummary, fetchClient, API_BASE_URL } from "../services/api";
-import axios from "axios"; // Ensure axios is imported
+import { ClientSummary, fetchClient, API_BASE_URL } from "../services/api";
+import axios from "axios";
 
 export const ClientSettingsPage = () => {
   const { clientId } = useParams<{ clientId: string }>();
   const [client, setClient] = useState<ClientSummary | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Helper to refresh client data after an action
-  const refreshClient = () => {
-    if (!clientId) return;
-    fetchClient(clientId).then(setClient);
-  };
+  // Form State
+  const [tone, setTone] = useState("");
+  const [tips, setTips] = useState("");
+  const [myths, setMyths] = useState("");
+  const [story, setStory] = useState("");
 
   useEffect(() => {
     if (!clientId) return;
     fetchClient(clientId)
-      .then(setClient)
+      .then((data) => {
+        setClient(data);
+        // Pre-fill form
+        const a = data.attributes || {};
+        setTone(a.tone || "");
+        setTips(Array.isArray(a.tips) ? a.tips.join("\n") : "");
+        setMyths(Array.isArray(a.myths) ? a.myths.join("\n") : "");
+        setStory(a.content_atoms?.story_mission || "");
+      })
       .catch((err) => alert(err.message))
       .finally(() => setLoading(false));
   }, [clientId]);
 
-  const connectPage = async (page: any) => {
-    if (!client || !clientId) return;
-    if (!confirm(`Connect the page "${page.name}" to this client?`)) return;
-
+  const handleSaveDNA = async () => {
+    if (!clientId) return;
     try {
-      // We save the specific page token as the "official" one
-      await axios.post(`${API_BASE_URL}/clients/${clientId}/attributes/merge`, {
-        facebook_page_id: page.id,
-        facebook_page_name: page.name,
-        facebook_page_token: page.access_token,
-        facebook_candidates: null // Clear the list to clean up UI
-      });
-      alert("Facebook Page Connected!");
-      refreshClient();
-    } catch (e) {
-      alert("Failed to save page selection.");
+      // Split text areas into lists
+      const tipsList = tips.split("\n").map(s => s.trim()).filter(Boolean);
+      const mythsList = myths.split("\n").map(s => s.trim()).filter(Boolean);
+
+      const payload = {
+        tone,
+        tips: tipsList,
+        myths: mythsList,
+        content_atoms: {
+          ...(client?.attributes?.content_atoms || {}),
+          story_mission: story
+        }
+      };
+
+      await axios.post(`${API_BASE_URL}/api/clients/${clientId}/attributes/merge`, payload);
+      alert("✅ Brand DNA Saved!");
+      // Refresh
+      const updated = await fetchClient(clientId);
+      setClient(updated);
+    } catch (e: any) {
+      alert("Failed to save: " + e.message);
     }
   };
 
@@ -48,94 +64,118 @@ export const ClientSettingsPage = () => {
     `${API_BASE_URL}/auth/${platform}/login?client_id=${client.id}`;
 
   const attrs = client.attributes || {};
-  const fbCandidates = attrs.facebook_candidates || [];
 
   return (
     <div>
       <div className="page-header">
         <h1>Settings · {client.name}</h1>
         <div className="page-header-actions">
+          <Link to={`/clients/${client.id}/approvals`} className="btn">Back to Approvals</Link>
           <Link to={`/clients/${client.id}`} className="btn">Back to Overview</Link>
         </div>
       </div>
 
-      <div className="card">
-        <h2>Social Connections</h2>
-        <p className="muted">Connect your social accounts to allow the bot to post automatically.</p>
+      <div className="card-grid">
+        {/* LEFT COLUMN: SOCIAL CONNECTIONS */}
+        <div className="card">
+          <h2>Social Connections</h2>
+          <p className="muted">Connect accounts to enable auto-posting.</p>
 
-        <div className="card-column" style={{ marginTop: "1rem" }}>
-
-          {/* X / Twitter */}
-          <div className="connection-row" style={rowStyle}>
-            <div>
-              <strong>X (Twitter)</strong>
-              {attrs.x_access_token ? (
-                <div style={connectedStyle}>✅ Connected</div>
-              ) : (
-                <div style={disconnectedStyle}>Not connected</div>
-              )}
-            </div>
-            {attrs.x_access_token ? (
-              <button className="btn" disabled>Connected</button>
-            ) : (
-              <a href={getLoginLink("x")} className="btn primary">Connect X</a>
-            )}
-          </div>
-
-          {/* LinkedIn */}
-          <div className="connection-row" style={rowStyle}>
-            <div>
-              <strong>LinkedIn</strong>
-              {attrs.linkedin_access_token ? (
-                <div style={connectedStyle}>✅ Connected</div>
-              ) : (
-                <div style={disconnectedStyle}>Not connected</div>
-              )}
-            </div>
-            {attrs.linkedin_access_token ? (
-              <button className="btn" disabled>Connected</button>
-            ) : (
-              <a href={getLoginLink("linkedin")} className="btn primary">Connect LinkedIn</a>
-            )}
-          </div>
-
-          {/* Facebook */}
-          <div className="connection-row" style={rowStyle}>
-            <div>
-              <strong>Facebook</strong>
-              {attrs.facebook_page_token ? (
-                <div style={connectedStyle}>✅ Connected to {attrs.facebook_page_name}</div>
-              ) : (
-                <div style={disconnectedStyle}>Not connected</div>
-              )}
-            </div>
-            {attrs.facebook_page_token ? (
-              <button className="btn" disabled>Connected</button>
-            ) : (
-              <a href={getLoginLink("facebook")} className="btn primary">Connect Facebook</a>
-            )}
-          </div>
-
-          {/* Facebook Page Selector (Shows up after login if multiple pages found) */}
-          {fbCandidates.length > 0 && (
-            <div style={{ background: "#f8fafc", padding: "1rem", borderRadius: "8px", border: "1px dashed #cbd5e1" }}>
-              <p style={{ margin: "0 0 0.5rem 0", fontWeight: 600 }}>Select a Facebook Page:</p>
-              <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                {fbCandidates.map((p: any) => (
-                  <button key={p.id} className="btn" onClick={() => connectPage(p)}>
-                    {p.name}
-                  </button>
-                ))}
+          <div className="card-column" style={{ marginTop: "1rem" }}>
+            {/* X / Twitter */}
+            <div className="connection-row">
+              <div>
+                <strong>X (Twitter)</strong>
+                {attrs.x_access_token ? <div className="conn-active">✅ Connected</div> : <div className="conn-inactive">Not connected</div>}
               </div>
+              {attrs.x_access_token ? <button className="btn" disabled>Connected</button> : <a href={getLoginLink("x")} className="btn primary">Connect X</a>}
             </div>
-          )}
 
+            {/* LinkedIn */}
+            <div className="connection-row">
+              <div>
+                <strong>LinkedIn</strong>
+                {attrs.linkedin_access_token ? <div className="conn-active">✅ Connected</div> : <div className="conn-inactive">Not connected</div>}
+              </div>
+              {attrs.linkedin_access_token ? <button className="btn" disabled>Connected</button> : <a href={getLoginLink("linkedin")} className="btn primary">Connect LinkedIn</a>}
+            </div>
+
+            {/* Facebook */}
+            <div className="connection-row">
+              <div>
+                <strong>Facebook</strong>
+                {attrs.facebook_page_token ? <div className="conn-active">✅ Connected</div> : <div className="conn-inactive">Not connected</div>}
+              </div>
+              {attrs.facebook_page_token ? <button className="btn" disabled>Connected</button> : <a href={getLoginLink("facebook")} className="btn primary">Connect Facebook</a>}
+            </div>
+          </div>
+        </div>
+
+        {/* RIGHT COLUMN: BRAND DNA EDITING */}
+        <div className="card">
+          <h2>Edit Brand DNA</h2>
+          <p className="muted">Required for generating posts.</p>
+
+          <div className="card-column" style={{ marginTop: "1rem" }}>
+
+            <label className="label">
+              <strong>Tone of Voice</strong>
+              <input
+                className="input"
+                value={tone}
+                onChange={e => setTone(e.target.value)}
+                placeholder="e.g. Professional, Friendly, Witty"
+              />
+            </label>
+
+            <label className="label">
+              <strong>Tips (One per line)</strong>
+              <textarea
+                className="input"
+                rows={4}
+                value={tips}
+                onChange={e => setTips(e.target.value)}
+                placeholder="e.g. Drink more water&#10;Stretch daily"
+              />
+            </label>
+
+            <label className="label">
+              <strong>Myths (One per line)</strong>
+              <textarea
+                className="input"
+                rows={4}
+                value={myths}
+                onChange={e => setMyths(e.target.value)}
+                placeholder="e.g. Carbs are bad&#10;Lifting makes you bulky"
+              />
+            </label>
+
+            <label className="label">
+              <strong>Mission / Origin Story</strong>
+              <textarea
+                className="input"
+                rows={3}
+                value={story}
+                onChange={e => setStory(e.target.value)}
+                placeholder="e.g. We started in 2010 to help..."
+              />
+            </label>
+
+            <button className="btn primary" onClick={handleSaveDNA} style={{ alignSelf: "flex-start" }}>
+              💾 Save Brand DNA
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* Styles inline for simplicity in this file */}
+      <style>{`
+        .connection-row { display: flex; align-items: center; justify-content: space-between; padding: 1rem; border: 1px solid #eee; borderRadius: 8px; }
+        .conn-active { color: green; font-size: 0.85rem; }
+        .conn-inactive { color: #666; font-size: 0.85rem; }
+        .label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; }
+        .input { padding: 0.5rem; border: 1px solid #ccc; border-radius: 6px; font-family: inherit; }
+      `}</style>
     </div>
   );
 };
-
-const rowStyle = { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "1rem", border: "1px solid #eee", borderRadius: "8px" };
-const connectedStyle = { color: "green", fontSize: "0.85rem" };
-const disconnectedStyle = { color: "#666", fontSize: "0.85rem" };
