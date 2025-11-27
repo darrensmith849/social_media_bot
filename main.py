@@ -63,6 +63,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("agency-bot")
 
 # ------------------
+# Global Cache for Dry Run
+# ------------------
+_DRY_RUN_CACHE = []
+
+# ------------------
 # Config helpers
 # ------------------
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Africa/Johannesburg"))
@@ -661,10 +666,16 @@ def update_post_candidate_metadata(candidate_id: int, updates: Dict[str, Any]) -
 # DB ingest
 # ------------------
 MAIN_ENGINE: Optional[Engine] = None
+_DRY_RUN_CACHE: Optional[List[Client]] = None
 
 
 def _sample_clients_for_dry() -> List[Client]:
-    return [
+    global _DRY_RUN_CACHE
+    if _DRY_RUN_CACHE:
+        return _DRY_RUN_CACHE
+        
+    # Initialize Cache if empty
+    _DRY_RUN_CACHE = [
         Client(
             id="dry-1",
             name="Joe's Gym",
@@ -673,9 +684,11 @@ def _sample_clients_for_dry() -> List[Client]:
             attributes={
                 "website": "https://joesgym.co.za",
                 "tips": ["Drink water!", "Never skip leg day."],
-                "negative_constraints": "Do not mention steroids. Do not use slang.",
+                "negative_constraints": "Do not mention steroids.",
                 "tone": "High Energy",
-                "offer_text": "Get 50% off your first month!"
+                # Add empty placeholders so Pre-flight check fails initially (for testing)
+                "myths": [], 
+                "content_atoms": {}
             }
         ),
         Client(
@@ -685,12 +698,14 @@ def _sample_clients_for_dry() -> List[Client]:
             city="Sandton",
             attributes={
                 "website": "https://smiledental.co.za",
-                "tips": ["Floss daily.", "Brush twice a day."],
+                "tips": [], # Intentionally empty for testing
+                "myths": [],
                 "negative_constraints": "No blood or scary needles.",
                 "tone": "Professional and Gentle"
             }
         )
     ]
+    return _DRY_RUN_CACHE
 
 def get_main_engine() -> Engine:
     global MAIN_ENGINE
@@ -1486,23 +1501,27 @@ def get_rejection_patterns(
 @app.post("/api/clients/{client_id}/attributes/merge")
 def merge_client_attributes(client_id: str, overrides: Dict[str, Any] = Body(...)):
     """
-    Merge manual attributes (Brand DNA).
-    Supports DRY_RUN by mocking the save operation.
+    Merge manual attributes.
+    In DRY_RUN, this updates the in-memory cache so changes persist during the session.
     """
-    # 1. Handle Dry Run / No DB
+    # 1. Handle Dry Run (In-Memory Update)
     if DRY_RUN or not DATABASE_URL:
-        logger.info(f"[DRY RUN] Mocking attribute save for client {client_id}")
-        logger.info(f"[DRY RUN] New Data: {json.dumps(overrides, indent=2)}")
+        logger.info(f"[DRY RUN] Updating memory for client {client_id}")
         
-        # In a real dry run with in-memory objects, we could technically update 
-        # the sample object in memory if we wanted, but for now just returning 
-        # success is enough to unblock the UI.
-        return {"ok": True, "client_id": client_id, "mock": True}
+        # Find the client in our cache
+        clients = fetch_clients() # This now returns the global list
+        target = next((c for c in clients if c.id == client_id), None)
+        
+        if target:
+            # Merge the new overrides into the existing attributes dict
+            target.attributes.update(overrides)
+            return {"ok": True, "client_id": client_id, "mock": True, "persisted": "memory"}
+        
+        return {"ok": False, "error": "Client not found in memory"}
 
+    # 2. Real DB Save (Existing Logic)
     try:
-        # 2. Real DB Save
         eng = get_main_engine()
-        
         with eng.begin() as conn:
             row = conn.execute(
                 text("SELECT attributes FROM clients WHERE id = :id"),
@@ -1514,14 +1533,11 @@ def merge_client_attributes(client_id: str, overrides: Dict[str, Any] = Body(...
 
             current_raw = row[0]
             current_attrs = {}
-            
             if isinstance(current_raw, dict):
                 current_attrs = current_raw
             elif isinstance(current_raw, str):
-                try:
-                    current_attrs = json.loads(current_raw)
-                except Exception:
-                    current_attrs = {}
+                try: current_attrs = json.loads(current_raw)
+                except: current_attrs = {}
             
             merged = {**current_attrs, **overrides}
             
