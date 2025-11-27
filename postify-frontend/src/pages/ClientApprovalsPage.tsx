@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
-  PostCandidate,
+  type PostCandidate,
   fetchClient,
   fetchPendingCandidates,
   approveCandidate,
   rejectCandidate,
-  ClientSummary,
+  type ClientSummary,
 } from "../services/api";
 
 export const ClientApprovalsPage = () => {

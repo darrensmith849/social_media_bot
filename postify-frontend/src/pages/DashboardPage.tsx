@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { ClientSummary, fetchClients } from "../services/api";
+import { type ClientSummary, fetchClients } from "../services/api";
 
 export const DashboardPage = () => {
   const [clients, setClients] = useState<ClientSummary[]>([]);

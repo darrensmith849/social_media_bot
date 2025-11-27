@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ClientSummary, fetchClient } from "../services/api";
+import { type ClientSummary, fetchClient } from "../services/api";
 
 export const ClientOverviewPage = () => {
   const { clientId } = useParams<{ clientId: string }>();
@@ -122,7 +122,7 @@ export const ClientOverviewPage = () => {
           <p>
             <strong>Product categories:</strong>{" "}
             {Array.isArray(a.product_categories) &&
-            a.product_categories.length ? (
+              a.product_categories.length ? (
               a.product_categories.join(" · ")
             ) : (
               <span className="muted">None detected</span>

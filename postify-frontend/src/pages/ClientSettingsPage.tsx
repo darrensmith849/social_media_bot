@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
-import { ClientSummary, fetchClient, API_BASE_URL } from "../services/api";
+import { type ClientSummary, fetchClient, API_BASE_URL } from "../services/api";
 import axios from "axios"; // Ensure axios is imported
 
 export const ClientSettingsPage = () => {
@@ -44,7 +44,7 @@ export const ClientSettingsPage = () => {
   if (loading) return <p>Loading...</p>;
   if (!client) return <p>Client not found</p>;
 
-  const getLoginLink = (platform: string) => 
+  const getLoginLink = (platform: string) =>
     `${API_BASE_URL}/auth/${platform}/login?client_id=${client.id}`;
 
   const attrs = client.attributes || {};
@@ -55,16 +55,16 @@ export const ClientSettingsPage = () => {
       <div className="page-header">
         <h1>Settings · {client.name}</h1>
         <div className="page-header-actions">
-           <Link to={`/clients/${client.id}`} className="btn">Back to Overview</Link>
+          <Link to={`/clients/${client.id}`} className="btn">Back to Overview</Link>
         </div>
       </div>
 
       <div className="card">
         <h2>Social Connections</h2>
         <p className="muted">Connect your social accounts to allow the bot to post automatically.</p>
-        
+
         <div className="card-column" style={{ marginTop: "1rem" }}>
-          
+
           {/* X / Twitter */}
           <div className="connection-row" style={rowStyle}>
             <div>
@@ -72,13 +72,13 @@ export const ClientSettingsPage = () => {
               {attrs.x_access_token ? (
                 <div style={connectedStyle}>✅ Connected</div>
               ) : (
-                 <div style={disconnectedStyle}>Not connected</div>
+                <div style={disconnectedStyle}>Not connected</div>
               )}
             </div>
             {attrs.x_access_token ? (
-               <button className="btn" disabled>Connected</button>
+              <button className="btn" disabled>Connected</button>
             ) : (
-               <a href={getLoginLink("x")} className="btn primary">Connect X</a>
+              <a href={getLoginLink("x")} className="btn primary">Connect X</a>
             )}
           </div>
 
@@ -89,16 +89,16 @@ export const ClientSettingsPage = () => {
               {attrs.linkedin_access_token ? (
                 <div style={connectedStyle}>✅ Connected</div>
               ) : (
-                 <div style={disconnectedStyle}>Not connected</div>
+                <div style={disconnectedStyle}>Not connected</div>
               )}
             </div>
             {attrs.linkedin_access_token ? (
-               <button className="btn" disabled>Connected</button>
+              <button className="btn" disabled>Connected</button>
             ) : (
-               <a href={getLoginLink("linkedin")} className="btn primary">Connect LinkedIn</a>
+              <a href={getLoginLink("linkedin")} className="btn primary">Connect LinkedIn</a>
             )}
           </div>
-          
+
           {/* Facebook */}
           <div className="connection-row" style={rowStyle}>
             <div>
@@ -106,13 +106,13 @@ export const ClientSettingsPage = () => {
               {attrs.facebook_page_token ? (
                 <div style={connectedStyle}>✅ Connected to {attrs.facebook_page_name}</div>
               ) : (
-                 <div style={disconnectedStyle}>Not connected</div>
+                <div style={disconnectedStyle}>Not connected</div>
               )}
             </div>
             {attrs.facebook_page_token ? (
-               <button className="btn" disabled>Connected</button>
+              <button className="btn" disabled>Connected</button>
             ) : (
-               <a href={getLoginLink("facebook")} className="btn primary">Connect Facebook</a>
+              <a href={getLoginLink("facebook")} className="btn primary">Connect Facebook</a>
             )}
           </div>
 
