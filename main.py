@@ -1904,33 +1904,35 @@ def api_generate_post(client_id: str):
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    # 2. Force 'Approval Mode' so it doesn't auto-publish
-    client.attributes["approval_mode"] = "always"
-
-    # 3. Implement generator logic with corrected variable scope
     try:
-        from telegram_approval import handle_scheduled_post
-        global TELEGRAM_APPROVAL_ENABLED  # CRITICAL: Tells Python we are modifying the module's global var
+        # 2. Generate Draft using local helpers (No external imports needed)
+        # Load templates and pick one based on the 4-1-1 rule
+        templates = load_templates()
+        count = monthly_count(client.id, datetime.now(TZ))
+        tpl = select_template(templates, client, count)
         
-        # Save current setting and temporarily override it
-        original_setting = TELEGRAM_APPROVAL_ENABLED
-        TELEGRAM_APPROVAL_ENABLED = True 
-
-        handle_scheduled_post(client, record_state=True)
+        # Render the text
+        text_body = render_text(tpl["text"], client)
+        media_url = client.attributes.get("hero_image_url") or FALLBACK_IMAGE_URL
+        platforms = tpl.get("platforms", [])
         
-        # Restore setting
-        TELEGRAM_APPROVAL_ENABLED = original_setting
+        # 3. Save directly to DB as PENDING
+        create_post_candidate(
+            client_id=client.id,
+            template_key=tpl["key"],
+            text_body=text_body,
+            media_url=media_url,
+            platforms=platforms,
+            slot_time=datetime.now(TZ),
+            status="PENDING",
+            metadata={"source": "manual_magic_button"}
+        )
         
         return {"ok": True, "message": "Draft generated!"}
-    
-    except ImportError:
-        # Fallback: If telegram_approval is missing, publish directly
-        publish_once(client, record_state=True) 
-        return {"ok": True, "message": "Draft published directly (No approval module)."}
         
     except Exception as e:
         logger.exception("Manual generation failed")
-        raise HTTPException(status_code=500, detail="Generation failed. Check Railway logs for details.")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
