@@ -43,6 +43,7 @@ from requests_oauthlib import OAuth1Session
 from jinja2 import Environment, BaseLoader, StrictUndefined
 
 from fastapi import FastAPI, Query, Body, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -1332,6 +1333,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Universal Agency Bot", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
 # SECURITY WARNING: In production, change "super-secret-key" to a real random string!
 app.add_middleware(SessionMiddleware, secret_key=os.getenv("API_SECRET_KEY", "super-secret-key"))
