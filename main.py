@@ -1486,15 +1486,24 @@ def get_rejection_patterns(
 @app.post("/api/clients/{client_id}/attributes/merge")
 def merge_client_attributes(client_id: str, overrides: Dict[str, Any] = Body(...)):
     """
-    Merge manual attributes (Brand DNA) into the existing JSON.
-    Includes robust type checking and error logging.
+    Merge manual attributes (Brand DNA).
+    Supports DRY_RUN by mocking the save operation.
     """
+    # 1. Handle Dry Run / No DB
+    if DRY_RUN or not DATABASE_URL:
+        logger.info(f"[DRY RUN] Mocking attribute save for client {client_id}")
+        logger.info(f"[DRY RUN] New Data: {json.dumps(overrides, indent=2)}")
+        
+        # In a real dry run with in-memory objects, we could technically update 
+        # the sample object in memory if we wanted, but for now just returning 
+        # success is enough to unblock the UI.
+        return {"ok": True, "client_id": client_id, "mock": True}
+
     try:
-        # 1. Get DB Engine
+        # 2. Real DB Save
         eng = get_main_engine()
         
         with eng.begin() as conn:
-            # 2. Fetch existing attributes
             row = conn.execute(
                 text("SELECT attributes FROM clients WHERE id = :id"),
                 {"id": client_id}
@@ -1503,8 +1512,6 @@ def merge_client_attributes(client_id: str, overrides: Dict[str, Any] = Body(...
             if not row:
                 raise HTTPException(status_code=404, detail="Client not found")
 
-            # 3. Safely Load Current Attributes
-            # Depending on the DB driver, this could be a Dict, a JSON String, or None.
             current_raw = row[0]
             current_attrs = {}
             
@@ -1514,15 +1521,10 @@ def merge_client_attributes(client_id: str, overrides: Dict[str, Any] = Body(...
                 try:
                     current_attrs = json.loads(current_raw)
                 except Exception:
-                    logger.warning(f"Could not parse attributes JSON for client {client_id}")
                     current_attrs = {}
             
-            # 4. Perform the Merge
-            # This combines the old data with the new form data
             merged = {**current_attrs, **overrides}
             
-            # 5. Save back to DB
-            # We use json.dumps() to ensure compatibility with all SQL drivers
             conn.execute(
                 text("UPDATE clients SET attributes = :attr WHERE id = :id"),
                 {"id": client_id, "attr": json.dumps(merged)}
@@ -1531,7 +1533,7 @@ def merge_client_attributes(client_id: str, overrides: Dict[str, Any] = Body(...
         return {"ok": True, "client_id": client_id}
 
     except Exception as e:
-        logger.exception("Brand DNA Save Failed") # This will show in Railway logs
+        logger.exception("Brand DNA Save Failed")
         raise HTTPException(status_code=500, detail=f"Save Failed: {str(e)}")
 
 
