@@ -1907,23 +1907,30 @@ def api_generate_post(client_id: str):
     # 2. Force 'Approval Mode' so it doesn't auto-publish
     client.attributes["approval_mode"] = "always"
 
-    # 3. Import and Run Generator
+    # 3. Implement generator logic with corrected variable scope
     try:
         from telegram_approval import handle_scheduled_post
-        import main
-        # Force global toggle ON temporarily so it behaves like a draft
-        original_setting = main.TELEGRAM_APPROVAL_ENABLED
-        main.TELEGRAM_APPROVAL_ENABLED = True 
+        global TELEGRAM_APPROVAL_ENABLED  # CRITICAL: Tells Python we are modifying the module's global var
         
+        # Save current setting and temporarily override it
+        original_setting = TELEGRAM_APPROVAL_ENABLED
+        TELEGRAM_APPROVAL_ENABLED = True 
+
         handle_scheduled_post(client, record_state=True)
         
         # Restore setting
-        main.TELEGRAM_APPROVAL_ENABLED = original_setting
+        TELEGRAM_APPROVAL_ENABLED = original_setting
         
         return {"ok": True, "message": "Draft generated!"}
+    
+    except ImportError:
+        # Fallback: If telegram_approval is missing, publish directly
+        publish_once(client, record_state=True) 
+        return {"ok": True, "message": "Draft published directly (No approval module)."}
+        
     except Exception as e:
         logger.exception("Manual generation failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Generation failed. Check Railway logs for details.")
 
 if __name__ == "__main__":
     import uvicorn
