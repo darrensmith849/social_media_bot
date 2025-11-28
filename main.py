@@ -666,6 +666,7 @@ def seed_demo_data():
                     "city": "Cape Town",
                     "attributes": json.dumps({
                         "website": "https://joesgym.co.za", 
+                        "hero_image_url": "https://images.unsplash.com/photo-1534438327276-14e5300c3a48?q=80&w=1470&auto=format&fit=crop",
                         "tone": "High Energy", 
                         "tips": ["Drink water!", "Never skip leg day"], 
                         "myths": ["Carbs are bad"], 
@@ -679,6 +680,7 @@ def seed_demo_data():
                     "city": "Sandton", 
                     "attributes": json.dumps({
                         "website": "https://smiledental.co.za", 
+                        "hero_image_url": "https://images.unsplash.com/photo-1606811841689-23dfddce3e95?q=80&w=1374&auto=format&fit=crop",
                         "tone": "Professional", 
                         "tips": ["Floss daily", "Brush twice"], 
                         "myths": ["Sugar is fine"], 

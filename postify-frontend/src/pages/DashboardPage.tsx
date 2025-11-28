@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { type ClientSummary, fetchClients } from "../services/api";
+import { ClientSummary, fetchClients } from "../services/api";
 
 export const DashboardPage = () => {
   const [clients, setClients] = useState<ClientSummary[]>([]);
@@ -8,73 +8,65 @@ export const DashboardPage = () => {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
-
-    const load = async () => {
-      try {
-        const data = await fetchClients();
-        if (!cancelled) {
-          setClients(data);
-        }
-      } catch (err: any) {
-        if (!cancelled) {
-          setError(err?.message || "Failed to load clients");
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      }
-    };
-
-    load();
-    return () => {
-      cancelled = true;
-    };
+    fetchClients()
+      .then(setClients)
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false));
   }, []);
 
-  if (loading) return <p>Loading your brands…</p>;
+  const getClientImage = (c: ClientSummary) => {
+    // 1. Try Hero Image from DB
+    if (c.attributes.hero_image_url) return c.attributes.hero_image_url;
+
+    // 2. Try Favicon from Website (Google Service)
+    if (c.attributes.website) {
+      // Remove protocol for cleaner domain usage if needed, but Google handles full URLs well
+      return `https://www.google.com/s2/favicons?domain=${c.attributes.website}&sz=256`;
+    }
+
+    // 3. Fallback Placeholder
+    return "https://via.placeholder.com/150?text=" + c.name.charAt(0);
+  };
+
+  if (loading) return <p>Loading...</p>;
   if (error) return <p className="error-text">{error}</p>;
-  if (!clients.length) {
-    return (
-      <div>
-        <h1>Your brands</h1>
-        <p>No clients yet. Once you add brands in the backend, they’ll appear here.</p>
-      </div>
-    );
-  }
 
   return (
     <div>
-      <h1>Your brands</h1>
-      <p className="muted">
-        Each brand has its own content brain, posting rules, and approvals.
-      </p>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "2rem" }}>
+        <div>
+          <h1 style={{ marginBottom: "0.5rem" }}>Your brands</h1>
+          <p className="muted">Overview of all active clients.</p>
+        </div>
+        {/* We will wire this up next */}
+        <button className="btn primary" disabled>+ Add Brand</button>
+      </div>
 
       <div className="card-grid">
         {clients.map((c) => (
-          <Link
-            key={c.id}
-            to={`/clients/${c.id}`}
-            className="card card-clickable"
-          >
-            <h2>{c.name}</h2>
-            <p className="muted">
-              {c.industry} · {c.city}
-            </p>
-            <p className="pill-row">
-              {c.attributes?.content_theme && (
-                <span className="pill">
-                  {c.attributes.content_theme}
-                </span>
-              )}
-              {Array.isArray(c.attributes?.content_pillars) &&
-                c.attributes.content_pillars.slice(0, 3).map((p: string) => (
-                  <span key={p} className="pill pill-soft">
-                    {p}
-                  </span>
-                ))}
-            </p>
+          <Link key={c.id} to={`/clients/${c.id}`} className="card card-clickable" style={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+
+            {/* Image Area */}
+            <div style={{
+              height: "140px",
+              width: "100%",
+              background: "#f1f5f9",
+              backgroundImage: `url(${getClientImage(c)})`,
+              backgroundSize: "cover",
+              backgroundPosition: "center"
+            }} />
+
+            {/* Content Area */}
+            <div style={{ padding: "1.25rem" }}>
+              <h3 style={{ marginTop: 0, marginBottom: "0.25rem" }}>{c.name}</h3>
+              <p className="muted" style={{ fontSize: "0.85rem", marginBottom: "1rem" }}>
+                {c.industry} · {c.city}
+              </p>
+
+              <div className="pill-row">
+                {c.attributes?.tone && <span className="pill">{c.attributes.tone}</span>}
+              </div>
+            </div>
           </Link>
         ))}
       </div>
