@@ -608,6 +608,40 @@ def get_post_candidate(candidate_id: int) -> Optional[Dict[str, Any]]:
     return data
 
 
+def ensure_main_db_schema():
+    """Creates the clients table and view if they don't exist."""
+    if not DATABASE_URL: return
+    
+    # Fix protocol for PyMySQL if needed
+    url = DATABASE_URL.replace("mysql://", "mysql+pymysql://")
+    
+    try:
+        eng = create_engine(url, pool_pre_ping=True)
+        with eng.begin() as conn:
+            # 1. Create Clients Table
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS clients (
+                    id VARCHAR(50) PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    website VARCHAR(255),
+                    industry VARCHAR(100),
+                    city VARCHAR(100),
+                    attributes JSON, 
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """))
+            
+            # 2. Create View (Required for fetch_clients)
+            conn.execute(text("""
+                CREATE OR REPLACE VIEW bot_clients_v AS
+                SELECT id, name, industry, city, attributes
+                FROM clients;
+            """))
+            logger.info("Main DB schema initialized.")
+    except Exception as e:
+        logger.error(f"Failed to init Main DB: {e}")
+
+
 def update_post_candidate_status(
     candidate_id: int,
     status: str,
@@ -712,7 +746,9 @@ def get_main_engine() -> Engine:
     if MAIN_ENGINE is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL is not set")
-        MAIN_ENGINE = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
+        # Fix protocol just in case
+        url = DATABASE_URL.replace("mysql://", "mysql+pymysql://")
+        MAIN_ENGINE = create_engine(url, future=True, pool_pre_ping=True)
     return MAIN_ENGINE
 
 def row_to_client(row: Row) -> Client:
@@ -1320,6 +1356,7 @@ def schedule_today_slots():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_bootstrap()
+    ensure_main_db_schema()
     schedule_today_slots()
     SCHED.add_job(schedule_today_slots, "cron", hour=0, minute=5)
     # Periodic pattern learner over rejected posts (once a day)
@@ -1500,57 +1537,54 @@ def get_rejection_patterns(
 
 @app.post("/api/clients/{client_id}/attributes/merge")
 def merge_client_attributes(client_id: str, overrides: Dict[str, Any] = Body(...)):
-    """
-    Merge manual attributes.
-    In DRY_RUN, this updates the in-memory cache so changes persist during the session.
-    """
-    # 1. Handle Dry Run (In-Memory Update)
-    if DRY_RUN or not DATABASE_URL:
-        logger.info(f"[DRY RUN] Updating memory for client {client_id}")
-        
-        # Find the client in our cache
-        clients = fetch_clients() # This now returns the global list
-        target = next((c for c in clients if c.id == client_id), None)
-        
-        if target:
-            # Merge the new overrides into the existing attributes dict
-            target.attributes.update(overrides)
-            return {"ok": True, "client_id": client_id, "mock": True, "persisted": "memory"}
-        
-        return {"ok": False, "error": "Client not found in memory"}
-
-    # 2. Real DB Save (Existing Logic)
-    try:
-        eng = get_main_engine()
-        with eng.begin() as conn:
-            row = conn.execute(
-                text("SELECT attributes FROM clients WHERE id = :id"),
-                {"id": client_id}
-            ).fetchone()
-
-            if not row:
-                raise HTTPException(status_code=404, detail="Client not found")
-
-            current_raw = row[0]
-            current_attrs = {}
-            if isinstance(current_raw, dict):
-                current_attrs = current_raw
-            elif isinstance(current_raw, str):
-                try: current_attrs = json.loads(current_raw)
-                except: current_attrs = {}
+    """Merge attributes. Prefers Real DB if available."""
+    
+    # 1. REAL DB SAVE (Priority)
+    if DATABASE_URL:
+        try:
+            # Fix protocol just in case
+            url = DATABASE_URL.replace("mysql://", "mysql+pymysql://")
+            eng = create_engine(url, pool_pre_ping=True)
             
-            merged = {**current_attrs, **overrides}
-            
-            conn.execute(
-                text("UPDATE clients SET attributes = :attr WHERE id = :id"),
-                {"id": client_id, "attr": json.dumps(merged)}
-            )
+            with eng.begin() as conn:
+                row = conn.execute(
+                    text("SELECT attributes FROM clients WHERE id = :id"),
+                    {"id": client_id}
+                ).fetchone()
 
-        return {"ok": True, "client_id": client_id}
+                if not row:
+                    # If not in DB, maybe it's a dry-run sample we want to "promote" to real DB?
+                    # For now, just fail or handle gracefully.
+                    return {"ok": False, "error": "Client not found in Database"}
 
-    except Exception as e:
-        logger.exception("Brand DNA Save Failed")
-        raise HTTPException(status_code=500, detail=f"Save Failed: {str(e)}")
+                current_raw = row[0]
+                current_attrs = {}
+                if isinstance(current_raw, dict):
+                    current_attrs = current_raw
+                elif isinstance(current_raw, str):
+                    try: current_attrs = json.loads(current_raw)
+                    except: current_attrs = {}
+                
+                merged = {**current_attrs, **overrides}
+                
+                conn.execute(
+                    text("UPDATE clients SET attributes = :attr WHERE id = :id"),
+                    {"id": client_id, "attr": json.dumps(merged)}
+                )
+            return {"ok": True, "client_id": client_id, "storage": "database"}
+        except Exception as e:
+            logger.exception("DB Save Failed")
+            raise HTTPException(status_code=500, detail=f"DB Error: {str(e)}")
+
+    # 2. IN-MEMORY FALLBACK (Only if no DB is connected)
+    logger.info(f"[Memory] Updating client {client_id}")
+    clients = fetch_clients()
+    target = next((c for c in clients if c.id == client_id), None)
+    if target:
+        target.attributes.update(overrides)
+        return {"ok": True, "client_id": client_id, "storage": "memory"}
+    
+    raise HTTPException(status_code=404, detail="Client not found")
 
 
 @app.post("/telegram/webhook")
