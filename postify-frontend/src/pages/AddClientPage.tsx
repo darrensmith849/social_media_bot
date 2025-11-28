@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { API_BASE_URL } from "../services/api";
 import axios from "axios";
-import { Globe, Loader2, CheckCircle } from "lucide-react";
+import { Globe, Loader2 } from "lucide-react";
 
 export const AddClientPage = () => {
     const [url, setUrl] = useState("");
