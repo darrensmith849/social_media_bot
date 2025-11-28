@@ -639,6 +639,66 @@ def ensure_main_db_schema():
         logger.error(f"Failed to init Main DB: {e}")
 
 
+def seed_demo_data():
+    """Populates the DB with demo clients if it is empty."""
+    if not DATABASE_URL: return
+    
+    # CRITICAL: Use PyMySQL protocol
+    url = DATABASE_URL.replace("mysql://", "mysql+pymysql://")
+    
+    try:
+        eng = create_engine(url, pool_pre_ping=True)
+        with eng.begin() as conn:
+            # Check if empty
+            count = conn.execute(text("SELECT COUNT(*) FROM clients")).scalar()
+            if count > 0:
+                logger.info("Database already has data. Skipping seed.")
+                return
+
+            logger.info("Seeding database with demo clients...")
+            
+            # Use parameterized query to avoid SQLAlchemy text() parsing issues with colons in JSON
+            rows = [
+                {
+                    "id": "joes_gym_1",
+                    "name": "Joe's Gym", 
+                    "industry": "Fitness", 
+                    "city": "Cape Town",
+                    "attributes": json.dumps({
+                        "website": "https://joesgym.co.za", 
+                        "tone": "High Energy", 
+                        "tips": ["Drink water!", "Never skip leg day"], 
+                        "myths": ["Carbs are bad"], 
+                        "content_atoms": {"story_mission": "We started in 2010 to help people get fit."}
+                    })
+                },
+                {
+                    "id": "smile_dental_1", 
+                    "name": "Smile Dental", 
+                    "industry": "Healthcare", 
+                    "city": "Sandton", 
+                    "attributes": json.dumps({
+                        "website": "https://smiledental.co.za", 
+                        "tone": "Professional", 
+                        "tips": ["Floss daily", "Brush twice"], 
+                        "myths": ["Sugar is fine"], 
+                        "content_atoms": {"story_mission": "Creating smiles since 1995."}
+                    })
+                }
+            ]
+            
+            stmt = text("""
+                INSERT INTO clients (id, name, industry, city, attributes) 
+                VALUES (:id, :name, :industry, :city, :attributes)
+            """)
+            
+            conn.execute(stmt, rows)
+            logger.info("Seeding complete!")
+            
+    except Exception as e:
+        logger.error(f"Failed to seed DB: {e}")
+
+
 def update_post_candidate_status(
     candidate_id: int,
     status: str,
@@ -1356,6 +1416,7 @@ def schedule_today_slots():
 async def lifespan(app: FastAPI):
     ensure_bootstrap()
     ensure_main_db_schema()
+    seed_demo_data()
     schedule_today_slots()
     SCHED.add_job(schedule_today_slots, "cron", hour=0, minute=5)
     # Periodic pattern learner over rejected posts (once a day)
