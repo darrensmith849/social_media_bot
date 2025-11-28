@@ -2118,5 +2118,60 @@ def api_generate_post(client_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
+    # If running directly, just start the server
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+@app.post("/api/onboard")
+def api_onboard_client(payload: Dict[str, str] = Body(...)):
+    url = payload.get("url")
+    if not url:
+        raise HTTPException(400, "Missing URL")
+        
+    fc_key = os.getenv("FIRECRAWL_API_KEY")
+    if not fc_key:
+        raise HTTPException(500, "Server missing Firecrawl API Key")
+
+    try:
+        from ingest import run_ingestion
+        data = run_ingestion(url, fc_key)
+        
+        # Save to DB
+        client_id = save_ingested_client(data, url)
+        return {"ok": True, "client_id": client_id}
+        
+    except Exception as e:
+        logger.exception("Onboarding failed")
+        raise HTTPException(500, str(e))
+
+def save_ingested_client(data: dict, url: str) -> str:
+    # Helper to write to DB
+    name = data.get('company_name', 'Unknown')
+    slug = name.replace(" ", "_").lower()[:10]
+    client_id = f"{slug}_{uuid.uuid4().hex[:4]}"
+    
+    attributes = {
+        "website": url,
+        "tone": data.get("tone"),
+        "negative_constraints": data.get("negative_constraints"),
+        "tips": data.get("tips") or [],
+        "myths": data.get("myths") or [],
+        "content_atoms": data.get("content_atoms") or {},
+        # ... map other fields as needed
+    }
+    
+    # Use our existing DB engine logic
+    eng = get_main_engine()
+    with eng.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO clients (id, name, industry, city, attributes)
+            VALUES (:id, :name, :ind, :city, :attr)
+        """), {
+            "id": client_id,
+            "name": name,
+            "ind": data.get("industry", "General"),
+            "city": data.get("city", "Internet"),
+            "attr": json.dumps(attributes)
+        })
+    return client_id
