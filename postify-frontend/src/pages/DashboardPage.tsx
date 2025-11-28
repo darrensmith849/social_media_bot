@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { ClientSummary, fetchClients } from "../services/api";
+import { fetchClients } from "../services/api";
+import type { ClientSummary } from "../services/api";
 
 export const DashboardPage = () => {
   const [clients, setClients] = useState<ClientSummary[]>([]);
@@ -20,7 +21,6 @@ export const DashboardPage = () => {
 
     // 2. Try Favicon from Website (Google Service)
     if (c.attributes.website) {
-      // Remove protocol for cleaner domain usage if needed, but Google handles full URLs well
       return `https://www.google.com/s2/favicons?domain=${c.attributes.website}&sz=256`;
     }
 
@@ -38,7 +38,6 @@ export const DashboardPage = () => {
           <h1 style={{ marginBottom: "0.5rem" }}>Your brands</h1>
           <p className="muted">Overview of all active clients.</p>
         </div>
-        {/* We will wire this up next */}
         <button className="btn primary" disabled>+ Add Brand</button>
       </div>
 
