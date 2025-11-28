@@ -612,13 +612,12 @@ def ensure_main_db_schema():
     """Creates the clients table and view if they don't exist."""
     if not DATABASE_URL: return
     
-    # Fix protocol for PyMySQL if needed
+    # CRITICAL FIX: Ensure we use the PyMySQL driver
     url = DATABASE_URL.replace("mysql://", "mysql+pymysql://")
     
     try:
         eng = create_engine(url, pool_pre_ping=True)
         with eng.begin() as conn:
-            # 1. Create Clients Table
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS clients (
                     id VARCHAR(50) PRIMARY KEY,
@@ -630,8 +629,6 @@ def ensure_main_db_schema():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """))
-            
-            # 2. Create View (Required for fetch_clients)
             conn.execute(text("""
                 CREATE OR REPLACE VIEW bot_clients_v AS
                 SELECT id, name, industry, city, attributes
@@ -746,9 +743,11 @@ def get_main_engine() -> Engine:
     if MAIN_ENGINE is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL is not set")
-        # Fix protocol just in case
-        url = DATABASE_URL.replace("mysql://", "mysql+pymysql://")
-        MAIN_ENGINE = create_engine(url, future=True, pool_pre_ping=True)
+        
+        # CRITICAL FIX: Ensure we use the PyMySQL driver
+        real_url = DATABASE_URL.replace("mysql://", "mysql+pymysql://")
+        
+        MAIN_ENGINE = create_engine(real_url, future=True, pool_pre_ping=True)
     return MAIN_ENGINE
 
 def row_to_client(row: Row) -> Client:
