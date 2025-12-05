@@ -2168,6 +2168,10 @@ def api_onboard_client(payload: Dict[str, str] = Body(...)):
         raise HTTPException(500, str(e))
 
 def save_ingested_client(data: dict, url: str) -> str:
+    # --- DEBUG LOG ---
+    print(f"DEBUG RAW DATA for {url}: {json.dumps(data, default=str)}")
+    # -----------------
+    
     name = data.get('company_name', 'Unknown')
     # Create a safe slug
     slug = name.replace(" ", "_").lower()
