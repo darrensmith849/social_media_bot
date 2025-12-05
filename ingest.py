@@ -56,25 +56,48 @@ def run_ingestion(url: str, api_key: str) -> Dict[str, Any]:
     urls = build_extraction_urls(url)
     
     try:
-        # FIX: Pass prompt and schema as direct keyword arguments
-        data = app.extract(
+        # Pass arguments as keywords
+        response = app.extract(
             urls,
             prompt="Extract brand identity, tone, and content atoms.",
             schema=BrandDNA.model_json_schema()
         )
-        # Normalize response (handling list or dict return)
-        if isinstance(data, dict) and "data" in data:
-            raw = data["data"]
-        elif isinstance(data, list):
-            raw = data
-        else:
-            raw = [data]
-            
-        first = raw[0]
-        payload = first.get("data") or first.get("structured") or first
         
+        # --- ROBUST RESPONSE HANDLING ---
+        # 1. Unwrap the Object if it has a .data attribute (SDK v1+)
+        if hasattr(response, "data"):
+            payload = response.data
+        else:
+            payload = response
+
+        # 2. If it's a list (batch result), take the first item
+        if isinstance(payload, list):
+            if not payload:
+                raise RuntimeError("Empty extraction result")
+            payload = payload[0]
+
+        # 3. If it's a Pydantic model (not a dict), convert it
+        if hasattr(payload, "model_dump"):
+            payload = payload.model_dump()
+        elif hasattr(payload, "dict"):
+            payload = payload.dict()
+            
+        # 4. Final safety check: ensure it is a dictionary
+        if not isinstance(payload, dict):
+             # Last ditch: try __dict__ if it's a generic object
+             if hasattr(payload, "__dict__"):
+                 payload = payload.__dict__
+        
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Unexpected response format: {type(payload)}")
+
+        # 5. Unwrap any nested 'data' or 'structured' keys inside the dict
+        payload = payload.get("data") or payload.get("structured") or payload
+
         # Add source for reference
-        payload["source_pages"] = urls
+        if isinstance(payload, dict):
+            payload["source_pages"] = urls
+            
         return payload
 
     except Exception as e:
