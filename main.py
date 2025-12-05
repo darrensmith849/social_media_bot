@@ -26,6 +26,7 @@ X_BEARER_TOKEN=
 """
 from __future__ import annotations
 import os
+import uuid
 import logging
 import hashlib
 import random
