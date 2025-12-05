@@ -7,9 +7,6 @@ from firecrawl import FirecrawlApp
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError 
 
-# Keep Schema Classes (ContentAtoms, ProductSpotlight, BrandDNA) exactly as they are...
-# (Agent, please assume the Pydantic models are unchanged here)
-
 class ContentAtoms(BaseModel):
     story_mission: Optional[str] = Field(default=None)
     services_benefits: Optional[List[str]] = Field(default_factory=list)
@@ -59,8 +56,7 @@ def run_ingestion(url: str, api_key: str) -> Dict[str, Any]:
     urls = build_extraction_urls(url)
     
     try:
-        # Note: Firecrawl SDK methods might vary, using 'scrape_url' or 'extract' depending on version.
-        # Assuming 'extract' based on previous context.
+        # FIX: Pass params as a keyword argument
         data = app.extract(
             urls,
             params={
