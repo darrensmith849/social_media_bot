@@ -1476,8 +1476,16 @@ def debug_env():
         "OPENAI_API_KEY"
     ]
     
+    # Metadata to identify the running environment
+    meta_keys = [
+        "RAILWAY_ENVIRONMENT_NAME",
+        "RAILWAY_GIT_BRANCH",
+        "RAILWAY_SERVICE_NAME"
+    ]
+
     return {
-        "all_keys": list(os.environ.keys()), # This reveals if there are typos/spaces in keys
+        "metadata": {k: os.getenv(k) for k in meta_keys},
+        "all_keys": list(os.environ.keys()), 
         "values": {k: mask(os.getenv(k)) for k in keys_to_check}
     }
 
