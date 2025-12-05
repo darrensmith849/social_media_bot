@@ -56,13 +56,11 @@ def run_ingestion(url: str, api_key: str) -> Dict[str, Any]:
     urls = build_extraction_urls(url)
     
     try:
-        # FIX: Pass params as a keyword argument
+        # FIX: Pass prompt and schema as direct keyword arguments
         data = app.extract(
             urls,
-            params={
-                "prompt": "Extract brand identity, tone, and content atoms.",
-                "schema": BrandDNA.model_json_schema(),
-            }
+            prompt="Extract brand identity, tone, and content atoms.",
+            schema=BrandDNA.model_json_schema()
         )
         # Normalize response (handling list or dict return)
         if isinstance(data, dict) and "data" in data:
