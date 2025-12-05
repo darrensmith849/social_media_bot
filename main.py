@@ -1462,6 +1462,25 @@ app.add_middleware(SessionMiddleware, secret_key=os.getenv("API_SECRET_KEY", "su
 def health():
     return {"ok": True, "time": datetime.now(TZ).isoformat(), "dry_run": DRY_RUN}
 
+@app.get("/debug-env")
+def debug_env():
+    # Helper to mask values for security
+    def mask(val):
+        if not val: return "MISSING"
+        return val[:4] + "***" + val[-4:] if len(val) > 8 else "***"
+
+    # List specific keys we care about
+    keys_to_check = [
+        "FIRECRAWL_API_KEY",
+        "DATABASE_URL", 
+        "OPENAI_API_KEY"
+    ]
+    
+    return {
+        "all_keys": list(os.environ.keys()), # This reveals if there are typos/spaces in keys
+        "values": {k: mask(os.getenv(k)) for k in keys_to_check}
+    }
+
 @app.get("/dry-run")
 def dry_run(count: int = Query(3)):
     clients = fetch_clients()
