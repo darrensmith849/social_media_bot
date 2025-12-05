@@ -63,7 +63,7 @@ def run_ingestion(url: str, api_key: str) -> Dict[str, Any]:
         # Assuming 'extract' based on previous context.
         data = app.extract(
             urls,
-            {
+            params={
                 "prompt": "Extract brand identity, tone, and content atoms.",
                 "schema": BrandDNA.model_json_schema(),
             }
