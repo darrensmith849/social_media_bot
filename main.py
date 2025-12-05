@@ -2169,17 +2169,35 @@ def api_onboard_client(payload: Dict[str, str] = Body(...)):
 
 def save_ingested_client(data: dict, url: str) -> str:
     name = data.get('company_name', 'Unknown')
-    slug = name.replace(" ", "_").lower()[:10]
+    # Create a safe slug
+    slug = name.replace(" ", "_").lower()
+    # Remove any non-alphanumeric chars to be safe
+    slug = "".join(c for c in slug if c.isalnum() or c == "_")[:15]
+    
     client_id = f"{slug}_{uuid.uuid4().hex[:4]}"
     
+    # Map ALL BrandDNA fields to attributes
     attributes = {
         "website": url,
-        "tone": data.get("tone"),
         "hero_image_url": f"https://www.google.com/s2/favicons?domain={url}&sz=256",
+        
+        # Core Identity
+        "tone": data.get("tone"),
         "negative_constraints": data.get("negative_constraints"),
+        "content_theme": data.get("content_theme"),
+        "content_pillars": data.get("content_pillars") or [],
+        "suggested_posts_per_week": data.get("suggested_posts_per_week"),
+        
+        # Content Atoms
         "tips": data.get("tips") or [],
         "myths": data.get("myths") or [],
         "content_atoms": data.get("content_atoms") or {},
+        
+        # Ecommerce Data
+        "is_ecommerce": data.get("is_ecommerce"),
+        "ecommerce_platform": data.get("ecommerce_platform"),
+        "product_categories": data.get("product_categories") or [],
+        "product_spotlights": data.get("product_spotlights") or [],
     }
     
     eng = get_main_engine()
